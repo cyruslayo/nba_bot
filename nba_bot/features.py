@@ -159,10 +159,20 @@ def build_game_state_rows(
         game_df = game_df.sort_values(["PERIOD", "PCTIMESTRING"], ascending=[True, False])
         game_rows = []  # rows for THIS game only — collected before home_win is known
         
-        # Pre-filter PBP data for THIS game only, instead of doing it per-play
-        game_pbp = None
+        # O(1) lookup map for PBP instead of slicing period dataframe dynamically
+        pbp_map = {}
         if pbp_lookup is not None:
             game_pbp = pbp_lookup[pbp_lookup["GAME_ID"] == game_id]
+            for _, r in game_pbp.iterrows():
+                period_val = r.get("PERIOD")
+                secs_val = r.get("_secs", 0)
+                st_val = r.get("STARTTYPE")
+                
+                if pd.notna(period_val):
+                    p_num = int(period_val)
+                    if p_num not in pbp_map:
+                        pbp_map[p_num] = []
+                    pbp_map[p_num].append((secs_val, st_val))
 
         # Determine team IDs from the first play (for player quality lookup)
         home_team_id  = None
@@ -212,22 +222,17 @@ def build_game_state_rows(
             if use_advanced:
                 starttype_encoded = STARTTYPE_FALLBACK  # default
 
-                if game_pbp is not None and not game_pbp.empty:
-                    # Time-range join: find matching possession in pbpstats
-                    # using GAMEID + PERIOD + ±2s clock window
-                    period_pbp = game_pbp[game_pbp["PERIOD"] == period]
-                    if not period_pbp.empty:
-                        try:
-                            play_secs = _to_secs(clock)  # uses module-level helper (M1 fix)
-                            window = period_pbp[
-                                (period_pbp["_secs"] >= play_secs - 2) &
-                                (period_pbp["_secs"] <= play_secs + 2)
-                            ]
-                            if not window.empty and "STARTTYPE" in window.columns:
-                                st_val = window.iloc[0]["STARTTYPE"]
-                                starttype_encoded = STARTTYPE_MAP.get(str(st_val), STARTTYPE_FALLBACK)
-                        except Exception:
-                            starttype_encoded = STARTTYPE_FALLBACK
+                if period in pbp_map:
+                    try:
+                        play_secs = _to_secs(clock)  # uses module-level helper (M1 fix)
+                        # O(1) loop through the pre-filtered list of plays for this period
+                        for p_secs, p_type in pbp_map[period]:
+                            if abs(p_secs - play_secs) <= 2:
+                                starttype_encoded = STARTTYPE_MAP.get(str(p_type), STARTTYPE_FALLBACK)
+                                break
+                    except Exception:
+                        starttype_encoded = STARTTYPE_FALLBACK
+
 
                 row["starttype_encoded"]   = starttype_encoded
                 row["player_quality_home"] = player_quality_home
