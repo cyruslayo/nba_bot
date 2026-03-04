@@ -174,18 +174,36 @@ def build_game_state_rows(
                         pbp_map[p_num] = []
                     pbp_map[p_num].append((secs_val, st_val))
 
-        # Determine team IDs from the first play (for player quality lookup)
-        home_team_id  = None
-        away_team_id  = None
-        first_play = game_df.iloc[0]
+        # Determine team IDs for player quality lookup.
+        # nba-on-court PBP format has no HOME_TEAM_ID column — instead it uses
+        # HOMEDESCRIPTION / VISITORDESCRIPTION flags alongside PLAYER1_TEAM_ID.
+        # We infer home/away team IDs by sampling plays where those description
+        # columns are populated and reading PLAYER1_TEAM_ID from that row.
+        home_team_id = None
+        away_team_id = None
+
+        # First try explicit team ID columns (older / alternate data sources)
         for col in ["HOME_TEAM_ID", "HTEAM_ID", "HOME_ID"]:
             if col in game_df.columns:
-                home_team_id = first_play.get(col)
+                home_team_id = game_df[col].dropna().iloc[0] if not game_df[col].dropna().empty else None
                 break
         for col in ["VISITOR_TEAM_ID", "VTEAM_ID", "AWAY_ID"]:
             if col in game_df.columns:
-                away_team_id = first_play.get(col)
+                away_team_id = game_df[col].dropna().iloc[0] if not game_df[col].dropna().empty else None
                 break
+
+        # Fallback: infer from HOMEDESCRIPTION / VISITORDESCRIPTION + PLAYER1_TEAM_ID
+        # (standard nba-on-court / nba_api nbastats format)
+        if home_team_id is None and "HOMEDESCRIPTION" in game_df.columns and "PLAYER1_TEAM_ID" in game_df.columns:
+            mask = game_df["HOMEDESCRIPTION"].notna() & game_df["PLAYER1_TEAM_ID"].notna()
+            candidates = game_df.loc[mask, "PLAYER1_TEAM_ID"]
+            if not candidates.empty:
+                home_team_id = candidates.iloc[0]
+        if away_team_id is None and "VISITORDESCRIPTION" in game_df.columns and "PLAYER1_TEAM_ID" in game_df.columns:
+            mask = game_df["VISITORDESCRIPTION"].notna() & game_df["PLAYER1_TEAM_ID"].notna()
+            candidates = game_df.loc[mask, "PLAYER1_TEAM_ID"]
+            if not candidates.empty:
+                away_team_id = candidates.iloc[0]
 
         # Player quality from ratings dict (T2 only)
         player_quality_home = 0.0
