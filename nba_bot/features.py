@@ -147,6 +147,10 @@ def build_game_state_rows(
     if use_advanced and df_pbpstats is not None:
         pbp = df_pbpstats.copy()
         pbp.columns = [c.upper() for c in pbp.columns]
+        # Precompute _secs for the entire PBP dataframe ONCE to avoid O(N^2) innermost loops
+        if "PCTIMESTRING" in pbp.columns:
+            # Handle potential nan values safely before passing to string conversion
+            pbp["_secs"] = pbp["PCTIMESTRING"].apply(lambda x: _to_secs(x) if pd.notna(x) else 0)
         pbp_lookup = pbp  # used for time-range join below
 
     all_rows = []
@@ -154,6 +158,11 @@ def build_game_state_rows(
     for game_id, game_df in df.groupby("GAME_ID"):
         game_df = game_df.sort_values(["PERIOD", "PCTIMESTRING"], ascending=[True, False])
         game_rows = []  # rows for THIS game only — collected before home_win is known
+        
+        # Pre-filter PBP data for THIS game only, instead of doing it per-play
+        game_pbp = None
+        if pbp_lookup is not None:
+            game_pbp = pbp_lookup[pbp_lookup["GAME_ID"] == game_id]
 
         # Determine team IDs from the first play (for player quality lookup)
         home_team_id  = None
@@ -203,26 +212,22 @@ def build_game_state_rows(
             if use_advanced:
                 starttype_encoded = STARTTYPE_FALLBACK  # default
 
-                if pbp_lookup is not None:
+                if game_pbp is not None and not game_pbp.empty:
                     # Time-range join: find matching possession in pbpstats
                     # using GAMEID + PERIOD + ±2s clock window
-                    game_pbp = pbp_lookup[pbp_lookup["GAME_ID"] == game_id]
-                    if not game_pbp.empty:
-                        period_pbp = game_pbp[game_pbp["PERIOD"] == period]
-                        if not period_pbp.empty:
-                            try:
-                                play_secs = _to_secs(clock)  # uses module-level helper (M1 fix)
-                                period_pbp = period_pbp.copy()
-                                period_pbp["_secs"] = period_pbp["PCTIMESTRING"].apply(_to_secs)
-                                window = period_pbp[
-                                    (period_pbp["_secs"] >= play_secs - 2) &
-                                    (period_pbp["_secs"] <= play_secs + 2)
-                                ]
-                                if not window.empty and "STARTTYPE" in window.columns:
-                                    st_val = window.iloc[0]["STARTTYPE"]
-                                    starttype_encoded = STARTTYPE_MAP.get(str(st_val), STARTTYPE_FALLBACK)
-                            except Exception:
-                                starttype_encoded = STARTTYPE_FALLBACK
+                    period_pbp = game_pbp[game_pbp["PERIOD"] == period]
+                    if not period_pbp.empty:
+                        try:
+                            play_secs = _to_secs(clock)  # uses module-level helper (M1 fix)
+                            window = period_pbp[
+                                (period_pbp["_secs"] >= play_secs - 2) &
+                                (period_pbp["_secs"] <= play_secs + 2)
+                            ]
+                            if not window.empty and "STARTTYPE" in window.columns:
+                                st_val = window.iloc[0]["STARTTYPE"]
+                                starttype_encoded = STARTTYPE_MAP.get(str(st_val), STARTTYPE_FALLBACK)
+                        except Exception:
+                            starttype_encoded = STARTTYPE_FALLBACK
 
                 row["starttype_encoded"]   = starttype_encoded
                 row["player_quality_home"] = player_quality_home
