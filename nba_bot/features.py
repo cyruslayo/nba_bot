@@ -26,12 +26,19 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # STARTTYPE encoding
 # ─────────────────────────────────────────────────────────────────────────────
-# Maps pbpstats STARTTYPE string values to integer codes.
-# These values were verified against real pbpstats CSV output.
-# IMPORTANT: Verify exact STARTTYPE enum strings from real CSV before
-# hardcoding this further (F6 from spec review).
-# Fallback code = 3 (unknown / other possession type).
+# Maps pbpstats.com STARTTYPE string values to integer codes.
+# pbpstats.com uses descriptive possession-start strings, not the canonical
+# NBA enum. We handle both formats:
+#   1. Exact legacy strings (older data sources)
+#   2. pbpstats.com format: "Off Arc 3 Miss", "Def AtRim Make", etc.
+#
+# Encoding:
+#   0 = turnover (live or dead ball)
+#   1 = offensive / defensive rebound after missed shot
+#   2 = start of possession after made shot / free throw  
+#   3 = jump ball / unknown (fallback)
 STARTTYPE_MAP = {
+    # Legacy / canonical names
     "LiveBallTurnover":  0,
     "Turnover":          0,
     "OffensiveRebound":  1,
@@ -43,6 +50,51 @@ STARTTYPE_MAP = {
     "Other":             3,
 }
 STARTTYPE_FALLBACK = 3
+
+
+def _encode_starttype(raw: str) -> int:
+    """
+    Encodes a STARTTYPE string to an integer category.
+    Handles both legacy canonical names and pbpstats.com descriptive strings.
+    
+    pbpstats.com examples:
+      'Off Arc 3 Miss'   → 1 (offensive rebound after miss)
+      'Off AtRim Miss'   → 1
+      'Off FT Miss'      → 1 (offensive rebound after missed FT)
+      'Def Arc 3 Make'   → 2 (possession after opponent made shot)
+      'Def AtRim Make'   → 2
+      'Off FT Make'      → 2 (after made FT, team gets new possession)
+      'Live Ball Turnover' / any Turnover → 0
+      'Jump Ball'        → 3
+    """
+    if not isinstance(raw, str) or not raw:
+        return STARTTYPE_FALLBACK
+
+    # Try exact match first (legacy canonical names)
+    exact = STARTTYPE_MAP.get(raw)
+    if exact is not None:
+        return exact
+
+    s = raw.lower()
+
+    # Turnover types (must check before 'make'/'miss' to avoid false matches)
+    if "turnover" in s or "live ball" in s or "dead ball" in s:
+        return 0
+
+    # Jump ball
+    if "jump" in s:
+        return 3
+
+    # After a made shot (team gets possession following made FG or FT)
+    if "make" in s:
+        return 2
+
+    # After a missed shot — rebound (offensive or defensive)
+    if "miss" in s:
+        return 1
+
+    return STARTTYPE_FALLBACK
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,6 +199,10 @@ def build_game_state_rows(
     if use_advanced and df_pbpstats is not None:
         pbp = df_pbpstats.copy()
         pbp.columns = [c.upper() for c in pbp.columns]
+        # pbpstats.com uses STARTTIME as the clock column, not PCTIMESTRING.
+        # Alias it so the rest of the code can use a single column name.
+        if "PCTIMESTRING" not in pbp.columns and "STARTTIME" in pbp.columns:
+            pbp = pbp.rename(columns={"STARTTIME": "PCTIMESTRING"})
         # Precompute _secs for the entire PBP dataframe ONCE to avoid O(N^2) innermost loops
         if "PCTIMESTRING" in pbp.columns:
             # Handle potential nan values safely before passing to string conversion
@@ -246,7 +302,7 @@ def build_game_state_rows(
                         # O(1) loop through the pre-filtered list of plays for this period
                         for p_secs, p_type in pbp_map[period]:
                             if abs(p_secs - play_secs) <= 2:
-                                starttype_encoded = STARTTYPE_MAP.get(str(p_type), STARTTYPE_FALLBACK)
+                                starttype_encoded = _encode_starttype(str(p_type))
                                 break
                     except Exception:
                         starttype_encoded = STARTTYPE_FALLBACK
