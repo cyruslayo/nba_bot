@@ -28,8 +28,9 @@ train = [
 ]
 
 [project.scripts]
-nba-bot-scan  = "nba_bot.scan:main"
-nba-bot-train = "nba_bot.train:main"
+nba-bot-scan   = "nba_bot.scan:main"
+nba-bot-train  = "nba_bot.train:main"
+nba-bot-settle = "nba_bot.settle:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

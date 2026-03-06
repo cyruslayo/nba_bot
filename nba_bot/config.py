@@ -72,3 +72,22 @@ FEATURES_T2 = [
 
 # Combined feature list for Tier 2 models
 FEATURES_ALL = FEATURES_T1 + FEATURES_T2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Paper trading persistence
+# ─────────────────────────────────────────────────────────────────────────────
+
+PAPER_TRADES_PATH   = os.environ.get("NBA_BOT_PAPER_TRADES_PATH",   "paper_trades.json")
+PAPER_BANKROLL_PATH = os.environ.get("NBA_BOT_PAPER_BANKROLL_PATH", "paper_bankroll.json")
+DEFAULT_BANKROLL    = 1000.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared HTTP headers
+# ─────────────────────────────────────────────────────────────────────────────
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+}

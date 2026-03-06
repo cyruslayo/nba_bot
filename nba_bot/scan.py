@@ -165,13 +165,22 @@ def run_markets_mode():
     sys.exit(0)
 
 
-def run_live_mode(model, feature_cols, use_ws: bool, interval: int):
+def run_live_mode(
+    model,
+    feature_cols,
+    use_ws: bool,
+    interval: int,
+    use_paper: bool = False,
+    initial_bankroll: float | None = None,
+):
     """
     Continuous polling loop. Fetches live NBA scores and Polymarket prices,
     computes edge, and prints alerts.
 
     If --ws is set, also starts the Polymarket WebSocket listener thread
     and uses WS-streamed prices instead of REST CLOB calls.
+
+    If --paper is set, auto-executes and logs paper trades to JSON files.
     """
     print()
     print("=" * 60)
@@ -184,6 +193,17 @@ def run_live_mode(model, feature_cols, use_ws: bool, interval: int):
     print(f"  Price source       : {'WS real-time' if use_ws else 'CLOB REST mid-point'}")
     if model is None:
         print("  [!] Model not loaded — edge computation disabled")
+
+    # Initialise paper trading if requested
+    if use_paper:
+        from nba_bot.paper import init_bankroll, _load_bankroll
+        init_bankroll(
+            initial_amount=initial_bankroll or config.DEFAULT_BANKROLL,
+            reset_if_exists=bool(initial_bankroll),
+        )
+        current_bankroll = _load_bankroll()
+        print(f"  Paper Trading      : ACTIVE  (bankroll: ${current_bankroll:.2f})")
+
     print("=" * 60)
     print()
 
@@ -278,6 +298,9 @@ def run_live_mode(model, feature_cols, use_ws: bool, interval: int):
                     print(f"\n  >>> {len(all_alerts)} ALERT(S) THIS SCAN <<<")
                     for alert in all_alerts:
                         print_alert(alert)
+                        if use_paper:
+                            from nba_bot.paper import execute_paper_trade
+                            execute_paper_trade(alert)
                 else:
                     print_no_edge(len(live_games), len(markets))
 
@@ -331,7 +354,25 @@ def main():
         help=f"Scan interval in seconds for live mode (default: {config.SCAN_INTERVAL_SEC})",
     )
 
+    parser.add_argument(
+        "--paper",
+        action="store_true",
+        help="Enable paper trading mode — auto-log trades to paper_trades.json",
+    )
+    parser.add_argument(
+        "--bankroll",
+        type=float,
+        default=None,
+        metavar="AMOUNT",
+        help="Initial paper trading bankroll (resets if already exists)",
+    )
+
     args = parser.parse_args()
+
+    # Warn if --paper used outside live mode
+    if args.paper and args.mode != "live":
+        print("  [!] --paper flag is only supported in --mode live. Ignoring.")
+        args.paper = False
 
     # Load model (non-fatal if not found)
     model_path   = args.model_path or config.MODEL_PATH
@@ -345,10 +386,12 @@ def main():
 
     else:  # live
         run_live_mode(
-            model        = model,
-            feature_cols = fcols,
-            use_ws       = args.ws,
-            interval     = args.interval,
+            model            = model,
+            feature_cols     = fcols,
+            use_ws           = args.ws,
+            interval         = args.interval,
+            use_paper        = args.paper,
+            initial_bankroll = args.bankroll,
         )
 
 

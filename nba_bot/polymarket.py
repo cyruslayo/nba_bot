@@ -23,6 +23,7 @@ from nba_bot.config import (
     CLOB_API,
     GAMMA_API,
     GAME_TAG_ID,
+    HEADERS,
     KELLY_FRACTION,
     MIN_EDGE,
     MIN_LIQUIDITY,
@@ -31,14 +32,6 @@ from nba_bot.config import (
 from nba_bot.model import predict_home_win_prob  # M4: no circular dependency
 
 logger = logging.getLogger(__name__)
-
-# User-Agent header — local to this module (mirrors original scanner)
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,12 +327,14 @@ def compute_edge(
             continue
 
         if edge > 0:
-            direction = "BUY YES"
-            stake     = kelly_stake(edge, live_yes)
+            direction   = "BUY YES"
+            stake       = kelly_stake(edge, live_yes)
+            enter_price = round(live_yes, 4)
         else:
-            no_price  = 1.0 - live_yes
-            direction = "BUY NO"
-            stake     = kelly_stake(abs(edge), no_price)
+            no_price    = 1.0 - live_yes
+            direction   = "BUY NO"
+            stake       = kelly_stake(abs(edge), no_price)
+            enter_price = round(no_price, 4)
 
         alerts.append({
             "timestamp":    datetime.now().strftime("%H:%M:%S"),
@@ -348,8 +343,11 @@ def compute_edge(
             "period":       game["period"],
             "clock":        game["clock"],
             "market":       mkt["question"],
+            "market_id":    mkt["market_id"],
+            "event_slug":   mkt["event_slug"],
             "model_prob":   round(model_prob, 4),
             "poly_price":   round(live_yes, 4),
+            "enter_price":  enter_price,
             "edge":         round(edge, 4),
             "edge_pct":     f"{round(edge * 100, 2)}%",
             "direction":    direction,

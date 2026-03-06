@@ -1,169 +1,211 @@
 # nba_bot — NBA Win Probability + Polymarket Edge Scanner
 
-Refactors three standalone scripts into an installable Python package with CLI entry points and a Google Colab training pipeline.
+This Python package (`nba_bot`) provides a complete pipeline to evaluate live NBA games using an XGBoost win-probability model and automatically scan Polymarket for positive Expected Value (+EV) trading opportunities. It also includes a simulated Paper Trading engine to test profitability without risking real capital.
 
-## Quick Start (< 5 minutes)
+---
+
+## 📋 Features
+
+- **Live Market Scanner:** Supports both REST polling and real-time WebSocket price streams (`nba-bot-scan`).
+- **Win Probability Model:** Feature engineering and XGBoost classification (`nba-bot-train`).
+- **Paper Trading Engine:** Auto-executes simulated trades directly from the scanner (`--paper`).
+- **Batch Settlement:** Resolves pending trades using Polymarket's Gamma API (`nba-bot-settle`).
+- **Google Colab Support:** Fast, GPU-backed model training notebooks for heavy data processing.
+
+---
+
+## 💻 Local Setup & Execution
+
+### 1. Prerequisites
+
+- Python 3.11+
+- git
+
+### 2. Installation
+
+Clone the repository and install the package in editable mode:
 
 ```bash
-# 1. Install the package
-cd /path/to/nba_bot
+git clone https://github.com/your-username/nba_bot.git
+cd nba_bot
+
+# Install the package and its dependencies
 pip install -e .
-
-# 2. Test the scanner (no model or live data needed)
-nba-bot-scan --mode test
-
-# 3. Check for live Polymarket NBA markets
-nba-bot-scan --mode markets
 ```
 
-To run the live scanner, you'll need a trained model first (see Training below).
+### 3. Environment Variables (Configuration)
 
----
+The bot reads standard configuration limits out of `nba_bot/config.py`, which you can override via system environment variables:
 
-## Installation
+| Variable | Default Value | Description |
+|----------|---------------|-------------|
+| `NBA_BOT_MODEL_PATH` | `./xgb_model_t1.pkl` | Path to your `.pkl` model file |
+| `NBA_BOT_TEAM_STATS_PATH` | `./team_stats.json` | Path to Tier 2 team ratings cache |
+| `NBA_BOT_PAPER_TRADES_PATH` | `./paper_trades.json` | Path for pending/settled paper trades |
+| `NBA_BOT_PAPER_BANKROLL_PATH` | `./paper_bankroll.json` | Path for current paper bankroll |
 
+**Example:**
 ```bash
-pip install -e .
+export NBA_BOT_MODEL_PATH=/path/to/my_model.pkl
 ```
 
-**Requirements:** Python 3.11+
+### 4. Training a Model
 
-**Dependencies** (auto-installed):
-| Package | Purpose |
-|---------|---------|
-| `nba-on-court` | Download pre-built PBP CSVs (fast training data) |
-| `xgboost` | Main win probability model |
-| `scikit-learn` | LR baseline + metrics |
-| `pandas` / `numpy` | Feature engineering |
-| `joblib` | Model serialization |
-| `tqdm` | Progress bars |
-| `nba_api` | Live scoreboard + team stats |
-| `requests` | Polymarket REST API |
-| `websocket-client` | Polymarket WS stream |
+To run the live scanner, you first need a trained XGBoost classifier.
 
----
+**Option A: Google Colab (Recommended for speed)**
+1. Upload `notebooks/nba_win_prob_colab.ipynb` to Google Colab.
+2. Run all cells to process historical play-by-play data and train the model.
+3. Download the resulting `xgb_model_t1.pkl` and `feature_cols.pkl` to your local machine.
+4. Set the `NBA_BOT_MODEL_PATH` environment variable to point to your `.pkl` file.
 
-## Training on Google Colab
-
-Colab is recommended (GPU available, faster downloads):
-
-1. Open `notebooks/nba_win_prob_colab.ipynb` in Colab
-2. **Cell 1**: Update `YOUR_REPO` with your actual GitHub URL
-3. Run all 9 cells top-to-bottom
-4. Download `xgb_model_t1.pkl` (or `t2`) + `feature_cols.pkl` from Google Drive
-5. Set env var: `export NBA_BOT_MODEL_PATH=/path/to/xgb_model_t1.pkl`
-
-### Colab cells summary:
-| Cell | Action |
-|------|--------|
-| 1 | pip install deps + clone + `pip install -e .` |
-| 2 | Mount Google Drive |
-| 3 | Config: `SEASONS`, `USE_ADVANCED_FEATURES` |
-| 4 | Download PBP data via `nba-on-court` |
-| 5 | Fetch team ratings (Tier-2 only) |
-| 6 | Feature engineering |
-| 7 | Train XGBoost + LR, print metrics |
-| 8 | Save artifacts to Drive |
-| 9 | Inference smoke test |
-
-### Expected metrics:
-- Tier-1: XGBoost AUC-ROC > 0.90
-- Tier-2: XGBoost AUC-ROC > 0.91
-
----
-
-## Local Training (CPU)
-
+**Option B: Local (CPU)**
 ```bash
-# Tier-1 model (faster, no external data joins)
+# Tier 1 model (basic features, lighter data)
 nba-bot-train --seasons 2022 2023 2024 --output-path ./models/
 
-# Tier-2 model (better accuracy, requires pbpstats download)
+# Tier 2 model (advanced tracking & ratings)
 nba-bot-train --seasons 2022 2023 2024 --output-path ./models/ --advanced
 ```
 
----
+### 5. Running the Scanner
 
-## Scanner Usage
+The `nba-bot-scan` tool connects the model to Polymarket prices.
 
-### Set model path
 ```bash
-export NBA_BOT_MODEL_PATH=/path/to/xgb_model_t1.pkl
-# Or pass inline:
-nba-bot-scan --model-path /path/to/xgb_model_t1.pkl --mode live
-```
-
-### Scanner modes
-```bash
-# Test mode — no live data or model required (always works)
+# 1. Test the scanner format (no live data needed)
 nba-bot-scan --mode test
 
-# List active Polymarket NBA markets
+# 2. View all active NBA game markets right now
 nba-bot-scan --mode markets
 
-# Live continuous scanner (REST prices, every 60s)
+# 3. Start Live Scanning (REST mid-point polling every 60s)
 nba-bot-scan --mode live
 
-# Live scanner with custom interval
-nba-bot-scan --mode live --interval 30
-
-# Live scanner with WebSocket prices (real-time, recommended)
+# 4. Start Live Scanning with WebSockets (Real-time speed, Recommended)
 nba-bot-scan --mode live --ws
 ```
 
----
+### 6. Paper Trading
 
-## Feature Tiers
+Enable paper trading to automatically record signals and track simulated profit & loss.
 
-### Tier 1 (6 features — always active)
+```bash
+# Start paper trading with an initial bankroll of $2000
+nba-bot-scan --mode live --ws --paper --bankroll 2000
 
-| Feature | Description |
-|---------|-------------|
-| `score_diff` | Home score − Away score |
-| `time_remaining` | Total seconds left in game |
-| `time_pressure` | `score_diff / √(time_remaining + 1)` |
-| `game_progress` | 0.0 at tipoff → 1.0 at buzzer |
-| `period` | Current quarter (1-4, 5+ = OT) |
-| `is_overtime` | 1 if overtime period, else 0 |
+# Pause and resume later (retains accumulated bankroll)
+nba-bot-scan --mode live --ws --paper
+```
 
-### Tier 2 (3 additional features — requires `--advanced`)
+**Next day Settlement:**
+After the NBA games finish, you need to settle your pending paper trades exactly as Polymarket resolved them:
 
-| Feature | Description |
-|---------|-------------|
-| `starttype_encoded` | Possession start type (0=turnover, 1=rebound, 2=shot, 3=other) |
-| `player_quality_home` | Home team estimated net rating |
-| `player_quality_away` | Away team estimated net rating |
+```bash
+# View active bankroll and pending trades
+nba-bot-settle --status
 
-Train Tier-2 model with `nba-bot-train --advanced` or set `USE_ADVANCED_FEATURES = True` in Colab Cell 3.
+# Preview settlement P&L math (without writing to the disk)
+nba-bot-settle --dry-run
 
----
-
-## Model Files
-
-After training, two files are produced:
-
-| File | Description |
-|------|-------------|
-| `xgb_model_t1.pkl` | Tier-1 XGBoost model |
-| `xgb_model_t2.pkl` | Tier-2 XGBoost model (with advanced features) |
-| `feature_cols.pkl` | Ordered feature list (must live in same directory as model) |
-
-⚠️ These files are gitignored (up to 200 MB). Store in Google Drive.
+# Commit settlement and update your paper bankroll
+nba-bot-settle
+```
 
 ---
 
-## Environment Variables
+## ☁️ Running on AWS VPS (Production)
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `NBA_BOT_MODEL_PATH` | `./xgb_model_t1.pkl` | Path to model .pkl file |
-| `NBA_BOT_TEAM_STATS_PATH` | `./team_stats.json` | Path to team ratings cache |
+Deploying to an AWS VPS (e.g., EC2 Ubuntu 24.04 or Amazon Linux 2023) is highly recommended for stable 24/7 background operation. 
+
+### 1. Provision & Install
+Connect to your EC2 instance via SSH and run:
+
+```bash
+sudo apt update && sudo apt upgrade -y
+sudo apt install python3.11 python3.11-venv git tmux -y
+
+git clone https://github.com/your-username/nba_bot.git
+cd nba_bot
+
+# Create an isolated environment
+python3.11 -m venv venv
+source venv/bin/activate
+pip install -e .
+```
+
+### 2. Copy the Model
+Use `scp` to upload your locally trained model file (or Google Drive URL) to the server:
+```bash
+# From your LOCAL machine
+scp -i path/to/your-key.pem path/to/xgb_model_t1.pkl ubuntu@<EC2-IP>:/home/ubuntu/nba_bot/
+```
+
+### 3. Running Continuously (Tmux)
+
+When you disconnect from SSH, the bot needs to keep running. Use `tmux` as a background terminal session:
+
+```bash
+# 1. Start a new tmux session called "scanner"
+tmux new -s scanner
+
+# 2. Activate virtual environment
+cd /home/ubuntu/nba_bot/
+source venv/bin/activate
+
+# 3. Export necessary environment variables 
+export NBA_BOT_MODEL_PATH=/home/ubuntu/nba_bot/xgb_model_t1.pkl
+
+# 4. Launch the live scanner with WS + Paper Trading!
+nba-bot-scan --mode live --ws --paper
+```
+
+*(Press `Ctrl+B`, then release and press `D` to detach and leave it running in the background).*
+
+To check on it later: `tmux attach -t scanner`
+
+### 4. Updating the Code & Restarting
+
+As you build new features locally and push to GitHub, you'll need to update your VPS:
+
+```bash
+cd /home/ubuntu/nba_bot/
+source venv/bin/activate
+
+# Pull latest updates
+git pull origin main
+
+# Re-install if any dependencies changed
+pip install -e .
+
+# Kill the old tmux session
+tmux kill-session -t scanner
+
+# Start a fresh session with your updated bot
+tmux new -s scanner
+source venv/bin/activate
+export NBA_BOT_MODEL_PATH=/home/ubuntu/nba_bot/xgb_model_t1.pkl
+nba-bot-scan --mode live --ws --paper
+```
+
+### 5. Automated Settlement (Cron)
+
+You want your paper trades to settle automatically at the end of the day or every morning. Add `nba-bot-settle` to the VPS crontab.
+
+```bash
+crontab -e
+```
+
+Add the following rule to run settlement every day at 10:00 AM UTC:
+```bash
+0 10 * * * cd /home/ubuntu/nba_bot && /home/ubuntu/nba_bot/venv/bin/nba-bot-settle >> /home/ubuntu/nba_bot/settle.log 2>&1
+```
 
 ---
 
-## Known Limitations
+## ⚠️ Known Limitations
 
-- **Team ratings temporal proxy**: Tier-2 training uses current-season ratings as a proxy for historical seasons 2021-2024 (lineup-specific historical ratings would be more accurate).
-- **Tier-2 player quality**: Team-level average net rating, not lineup-specific.
-- **Market matching**: Uses string matching on team name/city — may fail for non-standard Polymarket titles.
-- **Pre-game markets**: Scanner targets in-game markets only (no pre-tipoff support).
+- **Team ratings temporal proxy**: Tier-2 training uses current-season ratings as a proxy for historical seasons 2021-2024. Lineup-specific historical ratings would be more precise.
+- **Market matching mechanism**: Uses simple string matching on team name/city—this may falsely connect or drop non-standard Polymarket question syntaxes.
+- **Pre-game markets**: Scanner is specifically designed to target live, in-game variations (e.g. timeout shifts, mid-quarter). Pre-tipoff models perform suboptimally.
+- **No live money execution**: Currently strictly simulates bankrolls through the `--paper` flag. No Clob API private key routing is integrated natively.
