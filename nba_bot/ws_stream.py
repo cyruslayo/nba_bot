@@ -100,6 +100,15 @@ def derive_price(token_id: str) -> tuple[float | None, str]:
     return None, "no_data"
 
 
+def _store_price(token_id: str, price: float, source: str) -> None:
+    with price_lock:
+        price_cache[token_id] = {
+            "price": price,
+            "timestamp": time.time(),
+            "source": source,
+        }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # WebSocket listener class
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,10 +228,9 @@ class PolymarketPriceStream:
         with price_lock:
             orderbook_cache[token_id] = {"bids": bids, "asks": asks}
 
-        price, _ = derive_price(token_id)
+        price, source = derive_price(token_id)
         if price is not None:
-            with price_lock:
-                price_cache[token_id] = price
+            _store_price(token_id, price, source)
 
     def _handle_price_change(self, msg: dict):
         """
@@ -255,10 +263,9 @@ class PolymarketPriceStream:
                         else:
                             book["asks"].pop(price_str, None)
 
-                price, _ = derive_price(token_id)
+                price, source = derive_price(token_id)
                 if price is not None:
-                    with price_lock:
-                        price_cache[token_id] = price
+                    _store_price(token_id, price, source)
 
             except (ValueError, KeyError):
                 continue
@@ -280,9 +287,9 @@ class PolymarketPriceStream:
                 last_trade_cache[token_id] = trade_price
 
             # If no order book data yet, seed price_cache with last trade
-            if token_id not in price_cache or price_cache[token_id] == 0:
-                with price_lock:
-                    price_cache[token_id] = trade_price
+            cached_quote = price_cache.get(token_id)
+            if not isinstance(cached_quote, dict) or float(cached_quote.get("price", 0) or 0) <= 0:
+                _store_price(token_id, trade_price, "last_trade")
 
         except ValueError:
             pass

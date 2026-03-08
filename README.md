@@ -8,7 +8,7 @@ This Python package (`nba_bot`) provides a complete pipeline to evaluate live NB
 
 - **Live Market Scanner:** Supports both REST polling and real-time WebSocket price streams (`nba-bot-scan`).
 - **Win Probability Model:** Feature engineering and XGBoost classification (`nba-bot-train`).
-- **Paper Trading Engine:** Auto-executes simulated trades directly from the scanner (`--paper`).
+- **Paper Trading Engine:** Auto-executes simulated trades directly from the scanner (`--paper`). Includes a Hardened Mode with realistic slippage, fees, and latency (`--paper-hardened`).
 - **Batch Settlement:** Resolves pending trades using Polymarket's Gamma API (`nba-bot-settle`).
 - **Google Colab Support:** Fast, GPU-backed model training notebooks for heavy data processing.
 
@@ -39,7 +39,7 @@ The bot reads standard configuration limits out of `nba_bot/config.py`, which yo
 
 | Variable | Default Value | Description |
 |----------|---------------|-------------|
-| `NBA_BOT_MODEL_PATH` | `./xgb_model_t1.pkl` | Path to your `.pkl` model file |
+| `NBA_BOT_MODEL_PATH` | `./xgb_model_t2.pkl` | Path to your `.pkl` model file |
 | `NBA_BOT_TEAM_STATS_PATH` | `./team_stats.json` | Path to Tier 2 team ratings cache |
 | `NBA_BOT_PAPER_TRADES_PATH` | `./paper_trades.json` | Path for pending/settled paper trades |
 | `NBA_BOT_PAPER_BANKROLL_PATH` | `./paper_bankroll.json` | Path for current paper bankroll |
@@ -56,7 +56,7 @@ To run the live scanner, you first need a trained XGBoost classifier.
 **Option A: Google Colab (Recommended for speed)**
 1. Upload `notebooks/nba_win_prob_colab.ipynb` to Google Colab.
 2. Run all cells to process historical play-by-play data and train the model.
-3. Download the resulting `xgb_model_t1.pkl` and `feature_cols.pkl` to your local machine.
+3. Download the resulting `xgb_model_t2.pkl` and `feature_cols.pkl` to your local machine.
 4. Set the `NBA_BOT_MODEL_PATH` environment variable to point to your `.pkl` file.
 
 **Option B: Local (CPU)**
@@ -110,7 +110,54 @@ nba-bot-settle --dry-run
 
 # Commit settlement and update your paper bankroll
 nba-bot-settle
+
+# Commit settlement with platform fees applied (for hardened trades)
+nba-bot-settle --hardened
 ```
+
+---
+
+## 🛡️ Hardened Paper Trading
+
+Hardened mode adds realistic market frictions to paper trading, making backtests more conservative and reproducible.
+
+### What it simulates
+
+- **Slippage:** Price impact based on order size and recent trade volume
+- **Platform fees:** 2% fee deducted from gross profits on winning trades
+- **Fill probability:** Stochastic trade acceptance based on market depth and edge
+- **Order book depth:** VWAP estimation from live order books
+- **Latency simulation:** Execution delay with Gaussian price drift
+- **Edge calibration:** Decay factor and confidence caps on detected edge
+- **Liquidity constraints:** Minimum liquidity thresholds and stake caps
+- **Exposure caps:** Game-level limits to avoid correlated risk
+- **Stale price detection:** Rejects price data older than 30 seconds
+- **Data API integration:** Uses live trade history for slippage estimation
+
+### Runtime diagnostics
+
+- **Stale quote rejection:** Hardened mode logs when a market is skipped because the latest quote is older than the configured freshness threshold.
+- **Insufficient order-book depth:** If the live book cannot fully cover the requested stake, the scanner logs the partial depth and falls back to other slippage estimation paths.
+- **Slippage cap events:** If simulated slippage exceeds the configured maximum, the capped value is logged with the raw estimate and execution context.
+- **Execution rejection logging:** If an alert is valid but later rejected during hardened execution, the scanner logs the market, direction, calibrated edge, and price source for debugging.
+
+### Usage
+
+```bash
+# Start hardened paper trading with a deterministic seed (for reproducibility)
+nba-bot-scan --mode live --ws --paper-hardened --seed 42
+
+# Same, but with a custom bankroll
+nba-bot-scan --mode live --ws --paper-hardened --bankroll 5000 --seed 123
+
+# Settle hardened trades (applies platform fees to winners)
+nba-bot-settle --hardened
+
+# Preview hardened settlement without writing files
+nba-bot-settle --dry-run --hardened
+```
+
+**Tip:** Use `--seed` when you want to reproduce a specific run (e.g., debugging or parameter comparisons). Omit it for realistic variance across runs.
 
 ---
 
@@ -138,7 +185,7 @@ pip install -e .
 Use `scp` to upload your locally trained model file (or Google Drive URL) to the server:
 ```bash
 # From your LOCAL machine
-scp -i path/to/your-key.pem path/to/xgb_model_t1.pkl ubuntu@<EC2-IP>:/home/ubuntu/nba_bot/
+scp -i path/to/your-key.pem path/to/xgb_model_t2.pkl ubuntu@<EC2-IP>:/home/ubuntu/nba_bot/
 ```
 
 ### 3. Running Continuously (Tmux)
@@ -154,7 +201,7 @@ cd /home/ubuntu/nba_bot/
 source venv/bin/activate
 
 # 3. Export necessary environment variables 
-export NBA_BOT_MODEL_PATH=/home/ubuntu/nba_bot/xgb_model_t1.pkl
+export NBA_BOT_MODEL_PATH=/home/ubuntu/nba_bot/xgb_model_t2.pkl
 
 # 4. Launch the live scanner with WS + Paper Trading!
 nba-bot-scan --mode live --ws --paper
@@ -184,7 +231,7 @@ tmux kill-session -t scanner
 # Start a fresh session with your updated bot
 tmux new -s scanner
 source venv/bin/activate
-export NBA_BOT_MODEL_PATH=/home/ubuntu/nba_bot/xgb_model_t1.pkl
+export NBA_BOT_MODEL_PATH=/home/ubuntu/nba_bot/xgb_model_t2.pkl
 nba-bot-scan --mode live --ws --paper
 ```
 

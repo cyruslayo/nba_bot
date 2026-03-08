@@ -19,6 +19,7 @@ Flags:
 
 import argparse
 import logging
+import random
 import sys
 import time
 from datetime import datetime
@@ -171,7 +172,9 @@ def run_live_mode(
     use_ws: bool,
     interval: int,
     use_paper: bool = False,
+    use_paper_hardened: bool = False,
     initial_bankroll: float | None = None,
+    random_seed: int | None = None,
 ):
     """
     Continuous polling loop. Fetches live NBA scores and Polymarket prices,
@@ -182,6 +185,10 @@ def run_live_mode(
 
     If --paper is set, auto-executes and logs paper trades to JSON files.
     """
+    if random_seed is not None:
+        random.seed(random_seed)
+        logger.info("Random seed set to %d", random_seed)
+
     print()
     print("=" * 60)
     print(f"  NBA × POLYMARKET  —  {'WebSocket' if use_ws else 'REST'} Edge Scanner")
@@ -195,7 +202,21 @@ def run_live_mode(
         print("  [!] Model not loaded — edge computation disabled")
 
     # Initialise paper trading if requested
-    if use_paper:
+    if use_paper_hardened:
+        from nba_bot.market_analytics import check_data_api_available
+        from nba_bot.paper import _load_bankroll, init_bankroll
+
+        if not check_data_api_available():
+            print("  [!] Data API unavailable — hardened paper trading requires a live Data API connection.")
+            return
+
+        init_bankroll(
+            initial_amount=initial_bankroll or config.DEFAULT_BANKROLL,
+            reset_if_exists=bool(initial_bankroll),
+        )
+        current_bankroll = _load_bankroll()
+        print(f"  Paper Trading      : HARDENED  (bankroll: ${current_bankroll:.2f})")
+    elif use_paper:
         from nba_bot.paper import init_bankroll, _load_bankroll
         init_bankroll(
             initial_amount=initial_bankroll or config.DEFAULT_BANKROLL,
@@ -204,10 +225,6 @@ def run_live_mode(
         current_bankroll = _load_bankroll()
         print(f"  Paper Trading      : ACTIVE  (bankroll: ${current_bankroll:.2f})")
 
-    print("=" * 60)
-    print()
-
-    # Load team stats cache (for Tier-2 player quality)
     from nba_bot.team_stats_cache import load_team_stats
     team_stats = load_team_stats()
 
@@ -266,6 +283,10 @@ def run_live_mode(
 
             else:
                 all_alerts = []
+                current_bankroll = 0.0
+                if use_paper_hardened:
+                    from nba_bot.paper import _load_bankroll
+                    current_bankroll = _load_bankroll()
 
                 for game in live_games:
                     # Build Tier-2 context if model needs it
@@ -282,7 +303,6 @@ def run_live_mode(
                         )
                         advanced_ctx = ctx
 
-
                     alerts = compute_edge(
                         model         = model,
                         game          = game,
@@ -290,6 +310,8 @@ def run_live_mode(
                         feature_cols  = feature_cols,
                         advanced_ctx  = advanced_ctx,
                         price_cache   = ws_price_cache,
+                        hardened      = use_paper_hardened,
+                        bankroll      = current_bankroll,
                     )
                     all_alerts.extend(alerts)
 
@@ -298,7 +320,18 @@ def run_live_mode(
                     print(f"\n  >>> {len(all_alerts)} ALERT(S) THIS SCAN <<<")
                     for alert in all_alerts:
                         print_alert(alert)
-                        if use_paper:
+                        if use_paper_hardened:
+                            from nba_bot.paper import execute_paper_trade_hardened
+                            executed = execute_paper_trade_hardened(alert)
+                            if not executed:
+                                logger.info(
+                                    "Hardened alert rejected during execution | market_id=%s | direction=%s | edge=%.4f | price_source=%s",
+                                    alert.get("market_id"),
+                                    alert.get("direction"),
+                                    float(alert.get("calibrated_edge", alert.get("edge", 0.0)) or 0.0),
+                                    alert.get("price_source", "unknown"),
+                                )
+                        elif use_paper:
                             from nba_bot.paper import execute_paper_trade
                             execute_paper_trade(alert)
                 else:
@@ -360,11 +393,23 @@ def main():
         help="Enable paper trading mode — auto-log trades to paper_trades.json",
     )
     parser.add_argument(
+        "--paper-hardened",
+        action="store_true",
+        help="Enable hardened paper trading with realistic slippage, fees, fill probability, and latency",
+    )
+    parser.add_argument(
         "--bankroll",
         type=float,
         default=None,
         metavar="AMOUNT",
         help="Initial paper trading bankroll (resets if already exists)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        metavar="INT",
+        help="Random seed for reproducible hardened paper-trading simulations",
     )
 
     args = parser.parse_args()
@@ -372,6 +417,12 @@ def main():
     # Warn if --paper used outside live mode
     if args.paper and args.mode != "live":
         print("  [!] --paper flag is only supported in --mode live. Ignoring.")
+        args.paper = False
+    if args.paper_hardened and args.mode != "live":
+        print("  [!] --paper-hardened flag is only supported in --mode live. Ignoring.")
+        args.paper_hardened = False
+    if args.paper and args.paper_hardened:
+        print("  [!] --paper and --paper-hardened are mutually exclusive. Using --paper-hardened.")
         args.paper = False
 
     # Load model (non-fatal if not found)
@@ -391,9 +442,10 @@ def main():
             use_ws           = args.ws,
             interval         = args.interval,
             use_paper        = args.paper,
+            use_paper_hardened = args.paper_hardened,
             initial_bankroll = args.bankroll,
+            random_seed      = args.seed,
         )
-
 
 if __name__ == "__main__":
     main()

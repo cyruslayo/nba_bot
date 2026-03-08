@@ -3,10 +3,11 @@ nba_bot/settle.py
 =================
 Batch settlement CLI for paper trades — `nba-bot-settle`.
 
-Usage:
-    nba-bot-settle                  # settle all pending trades
-    nba-bot-settle --status         # print current bankroll + pending trades
-    nba-bot-settle --dry-run        # print settlement math; do NOT write files
+  Usage:
+      nba-bot-settle                  # settle all pending trades
+      nba-bot-settle --status         # print current bankroll + pending trades
+      nba-bot-settle --dry-run        # print settlement math; do NOT write files
+      nba-bot-settle --hardened       # apply platform fees when settling hardened paper trades
 """
 
 import argparse
@@ -17,8 +18,8 @@ from collections import defaultdict
 
 import requests
 
-from nba_bot.config import GAMMA_API, HEADERS, PAPER_BANKROLL_PATH, PAPER_TRADES_PATH
-from nba_bot.paper import _load_bankroll, _save_bankroll, load_trades, save_trades
+from nba_bot.config import GAMMA_API, HEADERS, PAPER_BANKROLL_PATH, PAPER_TRADES_PATH, PLATFORM_FEE_RATE
+from nba_bot.paper import _load_bankroll, _save_bankroll, classify_market_bucket, load_trades, save_trades
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,12 @@ def _run_status() -> None:
     bankroll = _load_bankroll()
     trades   = load_trades()
     pending  = [t for t in trades if t.get("status") == "PENDING"]
+    event_bucket_exposure: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+
+    for trade in pending:
+        event_slug = trade.get("event_slug", "?") or "?"
+        bucket = trade.get("bucket") or classify_market_bucket(trade.get("market", ""))
+        event_bucket_exposure[event_slug][bucket] += float(trade.get("stake", 0) or 0)
 
     print()
     print("=" * 60)
@@ -42,9 +49,20 @@ def _run_status() -> None:
 
     if pending:
         print()
+        print("  Pending exposure by event:")
+        for event_slug, bucket_totals in sorted(event_bucket_exposure.items()):
+            total_stake = sum(bucket_totals.values())
+            bucket_summary = ", ".join(
+                f"{bucket}=${amount:,.2f}"
+                for bucket, amount in sorted(bucket_totals.items())
+            )
+            print(f"    - {event_slug}: ${total_stake:,.2f} ({bucket_summary})")
+
+        print()
         for i, t in enumerate(pending, 1):
             print(f"  [{i}] {t.get('market', t.get('market_id', '?'))}")
             print(f"       Direction   : {t.get('direction')}")
+            print(f"       Bucket      : {t.get('bucket') or classify_market_bucket(t.get('market', ''))}")
             print(f"       Enter price : {t.get('enter_price')}")
             print(f"       Stake       : ${t.get('stake', 0):,.2f}")
             print(f"       Edge        : {t.get('edge', 0) * 100:.2f}%")
@@ -115,7 +133,7 @@ def _parse_outcome_prices(mkt: dict) -> tuple[str | None, str | None]:
 # Settlement logic
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _settle_trade(trade: dict, mkt: dict) -> dict | None:
+def _settle_trade(trade: dict, mkt: dict, hardened: bool = False) -> dict | None:
     """
     Attempt to settle *trade* against resolved *mkt*.
 
@@ -133,6 +151,7 @@ def _settle_trade(trade: dict, mkt: dict) -> dict | None:
     direction   = trade.get("direction", "")
     enter_price = float(trade.get("enter_price", 0))
     stake       = float(trade.get("stake", 0))
+    stored_shares = float(trade.get("shares", 0) or 0)
 
     if enter_price <= 0:
         logger.warning("Invalid enter_price for trade market_id=%s; skipping.", trade.get("market_id"))
@@ -144,9 +163,14 @@ def _settle_trade(trade: dict, mkt: dict) -> dict | None:
         (direction == "BUY NO"  and no_price  == "1")
     )
 
-    shares = stake / enter_price
+    shares = stored_shares if stored_shares > 0 else (stake / enter_price)
+    fee = 0.0
     if won:
-        payout = shares          # each share pays $1.00
+        gross_payout = shares          # each share pays $1.00
+        gross_profit = gross_payout - stake
+        if hardened and gross_profit > 0:
+            fee = round(gross_profit * PLATFORM_FEE_RATE, 2)
+        payout = gross_payout - fee
         profit = payout - stake
         status = "WON"
     else:
@@ -160,8 +184,10 @@ def _settle_trade(trade: dict, mkt: dict) -> dict | None:
         "shares":      round(shares, 6),
         "payout":      round(payout, 2),
         "profit":      round(profit, 2),
+        "fee":         round(fee, 2),
         "settled_yes": yes_price,
         "settled_no":  no_price,
+        "hardened":    bool(trade.get("hardened", False) or hardened),
     })
     return updated
 
@@ -170,10 +196,11 @@ def _settle_trade(trade: dict, mkt: dict) -> dict | None:
 # Main settlement run
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_settle(dry_run: bool) -> None:
+def _run_settle(dry_run: bool, hardened: bool = False) -> None:
     """Core settlement routine."""
     trades  = load_trades()
     pending = [(i, t) for i, t in enumerate(trades) if t.get("status") == "PENDING"]
+    has_hardened_pending = hardened or any(bool(t.get("hardened", False)) for _, t in pending)
 
     if not pending:
         print("\n  No pending trades to settle.\n")
@@ -186,6 +213,8 @@ def _run_settle(dry_run: bool) -> None:
     print(f"  Pending trades   : {len(pending)}")
     if dry_run:
         print("  *** DRY RUN — no files will be written ***")
+    if has_hardened_pending:
+        print("  *** HARDENED SETTLEMENT — platform fees applied ***")
     print()
 
     # Group pending trades by event_slug to minimise API requests
@@ -219,7 +248,8 @@ def _run_settle(dry_run: bool) -> None:
                 skipped_count += 1
                 continue
 
-            updated = _settle_trade(trade, mkt)
+            trade_hardened = bool(hardened or trade.get("hardened", False))
+            updated = _settle_trade(trade, mkt, hardened=trade_hardened)
             if updated is None:
                 print(f"  ⏳ PENDING  | {trade.get('market', market_id)[:50]} — market not yet closed")
                 skipped_count += 1
@@ -282,6 +312,7 @@ def main():
             "  nba-bot-settle\n"
             "  nba-bot-settle --status\n"
             "  nba-bot-settle --dry-run\n"
+            "  nba-bot-settle --hardened\n"
         ),
     )
     parser.add_argument(
@@ -294,12 +325,17 @@ def main():
         action="store_true",
         help="Compute settlement math but do not write any files",
     )
+    parser.add_argument(
+        "--hardened",
+        action="store_true",
+        help="Apply platform fees when settling hardened paper trades",
+    )
     args = parser.parse_args()
 
     if args.status:
         _run_status()
     else:
-        _run_settle(dry_run=args.dry_run)
+        _run_settle(dry_run=args.dry_run, hardened=args.hardened)
 
 
 if __name__ == "__main__":

@@ -15,19 +15,26 @@ Provides:
 
 import json
 import logging
+import re
+import time
 from datetime import datetime
 
 import requests
 
 from nba_bot.config import (
     CLOB_API,
+    EDGE_CONFIDENCE_THRESHOLD,
+    EDGE_DECAY_FACTOR,
     GAMMA_API,
     GAME_TAG_ID,
+    HARDENED_MIN_LIQUIDITY,
     HEADERS,
     KELLY_FRACTION,
+    MAX_STAKE_LIQUIDITY_PCT,
     MIN_EDGE,
     MIN_LIQUIDITY,
     NBA_SERIES_ID,
+    PRICE_STALE_THRESHOLD_SEC,
 )
 from nba_bot.model import predict_home_win_prob  # M4: no circular dependency
 
@@ -178,6 +185,62 @@ def fetch_clob_midpoint(token_id: str) -> float | None:
         return None
 
 
+def fetch_order_book(token_id: str) -> dict | None:
+    if not token_id:
+        return None
+
+    try:
+        resp = requests.get(
+            f"{CLOB_API}/book",
+            params={"token_id": token_id},
+            headers=HEADERS,
+            timeout=5,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        return payload if isinstance(payload, dict) else None
+    except Exception as e:
+        logger.debug("CLOB /book error for token %s: %s", token_id, e)
+        return None
+
+
+def compute_vwap_from_book(book: dict, side: str, stake: float) -> tuple[float | None, float]:
+    levels = book.get("asks", []) if side == "BUY" else book.get("bids", [])
+    if not isinstance(levels, list) or not levels:
+        return None, 0.0
+
+    total_cost = 0.0
+    total_shares = 0.0
+    remaining = stake
+
+    for level in levels:
+        try:
+            price = float(level.get("price", 0))
+            size = float(level.get("size", 0))
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+        if price <= 0 or price >= 1 or size <= 0:
+            continue
+
+        level_cost = price * size
+        if level_cost <= remaining:
+            total_cost += level_cost
+            total_shares += size
+            remaining -= level_cost
+        else:
+            shares_from_level = remaining / price
+            total_cost += remaining
+            total_shares += shares_from_level
+            remaining = 0.0
+            break
+
+    if total_shares <= 0 or remaining > 1e-6:
+        return None, total_shares
+
+    return total_cost / total_shares, total_shares
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Kelly criterion
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,6 +312,110 @@ def match_game_to_markets(game: dict, markets: list[dict]) -> list[tuple[dict, s
     return matched
 
 
+def _normalize_market_text(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", (value or "").lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _classify_market_type(question: str) -> str:
+    normalized = _normalize_market_text(question)
+    if "1h" in normalized or "1st half" in normalized or "first half" in normalized:
+        return "first_half"
+    if "spread" in normalized:
+        return "spread"
+    if "o u" in normalized or "over under" in normalized or "total" in normalized:
+        return "total"
+    return "moneyline"
+
+
+def _team_aliases(game: dict, side: str) -> set[str]:
+    aliases = {
+        game.get(f"{side}_team", ""),
+        game.get(f"{side}_city", ""),
+        f"{game.get(f'{side}_city', '')} {game.get(f'{side}_team', '')}".strip(),
+    }
+    return {
+        _normalize_market_text(alias)
+        for alias in aliases
+        if alias
+    }
+
+
+def _outcome_matches_team(label: str, aliases: set[str]) -> bool:
+    normalized_label = _normalize_market_text(label)
+    if not normalized_label:
+        return False
+    return any(
+        alias and (alias == normalized_label or alias in normalized_label or normalized_label in alias)
+        for alias in aliases
+    )
+
+
+def _resolve_team_outcome_mapping(game: dict, market: dict) -> dict[str, int] | None:
+    outcomes = market.get("outcomes") or []
+    if len(outcomes) < 2:
+        return None
+
+    home_aliases = _team_aliases(game, "home")
+    away_aliases = _team_aliases(game, "away")
+    home_matches = [idx for idx, label in enumerate(outcomes[:2]) if _outcome_matches_team(label, home_aliases)]
+    away_matches = [idx for idx, label in enumerate(outcomes[:2]) if _outcome_matches_team(label, away_aliases)]
+
+    if len(home_matches) != 1 or len(away_matches) != 1:
+        return None
+    if home_matches[0] == away_matches[0]:
+        return None
+
+    return {
+        "home_index": home_matches[0],
+        "away_index": away_matches[0],
+    }
+
+
+def _load_outcome_price(token_id: str | None, fallback_price: float | None, price_cache: dict | None) -> tuple[float | None, str, float | None]:
+    live_price = None
+    price_source = "Gamma (cached)"
+    price_timestamp = None
+
+    if price_cache is not None and token_id in price_cache:
+        cached_quote = price_cache[token_id]
+        if isinstance(cached_quote, dict):
+            try:
+                live_price = float(cached_quote.get("price"))
+            except (TypeError, ValueError):
+                live_price = None
+            timestamp_value = cached_quote.get("timestamp")
+            if isinstance(timestamp_value, (int, float)):
+                price_timestamp = float(timestamp_value)
+            cached_source = cached_quote.get("source")
+            if isinstance(cached_source, str) and cached_source:
+                price_source = f"WS ({cached_source})"
+        else:
+            try:
+                live_price = float(cached_quote)
+            except (TypeError, ValueError):
+                live_price = None
+        if live_price is not None:
+            if price_timestamp is None:
+                price_timestamp = time.time()
+            if price_source == "Gamma (cached)":
+                price_source = "WS (live)"
+
+    if live_price is None:
+        live_price = fetch_clob_midpoint(token_id)
+        if live_price is not None:
+            price_source = "CLOB (live)"
+            price_timestamp = time.time()
+
+    if live_price is None and fallback_price is not None:
+        try:
+            live_price = float(fallback_price)
+        except (TypeError, ValueError):
+            live_price = None
+
+    return live_price, price_source, price_timestamp
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Edge computation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,6 +427,8 @@ def compute_edge(
     feature_cols: list | None = None,
     advanced_ctx: dict | None = None,
     price_cache: dict | None = None,
+    hardened: bool = False,
+    bankroll: float = 0.0,
 ) -> list[dict]:
     """
     For a single live game, finds matching Polymarket markets, fetches the
@@ -275,6 +444,9 @@ def compute_edge(
                       player_quality_home, player_quality_away}.
         price_cache:  Optional dict {token_id: float} from ws_stream module.
                       If provided, WS prices are used instead of CLOB REST calls.
+        hardened:     If True, applies additional risk controls (stale price checks,
+                      edge calibration, liquidity-based stake caps).
+        bankroll:     If > 0, applies liquidity-based stake caps.
 
     Returns:
         List of alert dicts (empty if no edge found or model is None).
@@ -299,42 +471,146 @@ def compute_edge(
 
     alerts = []
 
-    for mkt, perspective in matched_markets:
-        model_prob = home_prob if perspective == "home" else away_prob
-
-        yes_token   = mkt.get("clob_yes_id") or mkt.get("yes_token")
-        live_yes    = None
-        price_source = "Gamma (cached)"
-
-        # Try WS cache first (if provided by ws scanner)
-        if price_cache is not None and yes_token in price_cache:
-            live_yes     = price_cache[yes_token]
-            price_source = "WS (live)"
-
-        # Fall back to CLOB REST
-        if live_yes is None:
-            live_yes = fetch_clob_midpoint(yes_token)
-            if live_yes is not None:
-                price_source = "CLOB (live)"
-
-        # Final fallback: use Gamma cached price
-        if live_yes is None:
-            live_yes = mkt["yes_price"]
-
-        edge = model_prob - live_yes
-
-        if abs(edge) < MIN_EDGE:
+    for mkt, _ in matched_markets:
+        market_type = _classify_market_type(mkt.get("question", ""))
+        if market_type != "moneyline":
+            if hardened:
+                logger.debug(
+                    "Skipping hardened market — unsupported market type | market_id=%s | market_type=%s | question=%s",
+                    mkt.get("market_id"),
+                    market_type,
+                    mkt.get("question", ""),
+                )
             continue
 
-        if edge > 0:
-            direction   = "BUY YES"
-            stake       = kelly_stake(edge, live_yes)
-            enter_price = round(live_yes, 4)
+        outcome_mapping = _resolve_team_outcome_mapping(game, mkt)
+        if outcome_mapping is None:
+            if hardened:
+                logger.debug(
+                    "Skipping hardened market — unresolved team outcome mapping | market_id=%s | outcomes=%s | question=%s",
+                    mkt.get("market_id"),
+                    mkt.get("outcomes"),
+                    mkt.get("question", ""),
+                )
+            continue
+
+        yes_token   = mkt.get("clob_yes_id") or mkt.get("yes_token")
+        no_token    = mkt.get("clob_no_id") or mkt.get("no_token")
+        quotes = {
+            0: _load_outcome_price(yes_token, mkt.get("yes_price"), price_cache),
+            1: _load_outcome_price(no_token, mkt.get("no_price"), price_cache),
+        }
+
+        home_index = outcome_mapping["home_index"]
+        away_index = outcome_mapping["away_index"]
+        home_price, home_price_source, home_price_timestamp = quotes[home_index]
+        away_price, away_price_source, away_price_timestamp = quotes[away_index]
+
+        if home_price is None or away_price is None:
+            if hardened:
+                logger.debug(
+                    "Skipping hardened market — missing live outcome price | market_id=%s | home_price=%s | away_price=%s | question=%s",
+                    mkt.get("market_id"),
+                    home_price,
+                    away_price,
+                    mkt.get("question", ""),
+                )
+            continue
+
+        candidates = [
+            {
+                "team_side": "home",
+                "outcome_index": home_index,
+                "model_prob": home_prob,
+                "market_price": home_price,
+                "price_source": home_price_source,
+                "price_timestamp": home_price_timestamp,
+                "edge": home_prob - home_price,
+            },
+            {
+                "team_side": "away",
+                "outcome_index": away_index,
+                "model_prob": away_prob,
+                "market_price": away_price,
+                "price_source": away_price_source,
+                "price_timestamp": away_price_timestamp,
+                "edge": away_prob - away_price,
+            },
+        ]
+        candidates = [candidate for candidate in candidates if candidate["edge"] >= MIN_EDGE]
+        if not candidates:
+            if hardened:
+                best_edge = max(home_prob - home_price, away_prob - away_price)
+                logger.debug(
+                    "Skipping hardened market — below min edge after outcome mapping | market_id=%s | best_edge=%.4f | threshold=%.4f | question=%s",
+                    mkt.get("market_id"),
+                    best_edge,
+                    MIN_EDGE,
+                    mkt.get("question", ""),
+                )
+            continue
+
+        selected = max(candidates, key=lambda candidate: candidate["edge"])
+        model_prob = selected["model_prob"]
+        selected_price = selected["market_price"]
+        price_source = selected["price_source"]
+        price_timestamp = selected["price_timestamp"]
+        edge = selected["edge"]
+        selected_outcome_index = selected["outcome_index"]
+        trade_token = yes_token if selected_outcome_index == 0 else no_token
+        direction = "BUY YES" if selected_outcome_index == 0 else "BUY NO"
+
+        if hardened:
+            price_age = None if price_timestamp is None else (time.time() - price_timestamp)
+            if price_age is None or price_age > PRICE_STALE_THRESHOLD_SEC:
+                logger.info(
+                    "Skipping hardened market — stale quote | market_id=%s | source=%s | age=%s | threshold=%ss | question=%s",
+                    mkt.get("market_id"),
+                    price_source,
+                    "unknown" if price_age is None else f"{price_age:.1f}s",
+                    PRICE_STALE_THRESHOLD_SEC,
+                    mkt.get("question", ""),
+                )
+                continue
+
+        if hardened:
+            calibrated_edge = edge * EDGE_DECAY_FACTOR
+            calibrated_edge = max(
+                min(calibrated_edge, EDGE_CONFIDENCE_THRESHOLD),
+                -EDGE_CONFIDENCE_THRESHOLD,
+            )
         else:
-            no_price    = 1.0 - live_yes
-            direction   = "BUY NO"
-            stake       = kelly_stake(abs(edge), no_price)
-            enter_price = round(no_price, 4)
+            calibrated_edge = edge
+
+        liquidity = float(mkt.get("liquidity", 0) or 0)
+        if hardened:
+            if liquidity < HARDENED_MIN_LIQUIDITY:
+                logger.debug(
+                    "Skipping hardened market — below hardened liquidity | market_id=%s | liquidity=%.2f | threshold=%s | question=%s",
+                    mkt.get("market_id"),
+                    liquidity,
+                    HARDENED_MIN_LIQUIDITY,
+                    mkt.get("question", ""),
+                )
+                continue
+
+        stake = kelly_stake(abs(calibrated_edge), selected_price)
+        enter_price = round(selected_price, 4)
+
+        if hardened and bankroll > 0:
+            max_stake_fraction = (liquidity * MAX_STAKE_LIQUIDITY_PCT) / bankroll
+            stake = min(stake, max(max_stake_fraction, 0.0))
+
+        if stake <= 0:
+            if hardened:
+                logger.debug(
+                    "Skipping hardened market — zero stake after caps | market_id=%s | liquidity=%.2f | bankroll=%.2f | question=%s",
+                    mkt.get("market_id"),
+                    liquidity,
+                    bankroll,
+                    mkt.get("question", ""),
+                )
+            continue
 
         alerts.append({
             "timestamp":    datetime.now().strftime("%H:%M:%S"),
@@ -346,15 +622,22 @@ def compute_edge(
             "market_id":    mkt["market_id"],
             "event_slug":   mkt["event_slug"],
             "model_prob":   round(model_prob, 4),
-            "poly_price":   round(live_yes, 4),
+            "poly_price":   round(selected_price, 4),
             "enter_price":  enter_price,
             "edge":         round(edge, 4),
+            "calibrated_edge": round(calibrated_edge, 4),
             "edge_pct":     f"{round(edge * 100, 2)}%",
             "direction":    direction,
             "kelly_stake":  f"{round(stake * 100, 2)}% of bankroll",
             "raw_stake":    stake,
-            "liquidity":    mkt["liquidity"],
+            "liquidity":    liquidity,
             "price_source": price_source,
+            "yes_token":    yes_token,
+            "no_token":     no_token,
+            "trade_token":  trade_token,
+            "selected_outcome": (mkt.get("outcomes") or [None, None])[selected_outcome_index],
+            "clob_yes_id":  mkt.get("clob_yes_id"),
+            "clob_no_id":   mkt.get("clob_no_id"),
             "url":          mkt["url"],
         })
 
