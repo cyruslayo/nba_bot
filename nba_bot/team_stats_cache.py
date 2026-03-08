@@ -49,7 +49,7 @@ def refresh_team_stats(output_path: str | None = None) -> dict:
     try:
         from nba_api.stats.endpoints import leaguedashteamstats
         resp = leaguedashteamstats.LeagueDashTeamStats(
-            per_mode_simple="PerGame",
+            per_mode_detailed="PerGame",
             measure_type_detailed_defense="Advanced",
         )
         df = resp.get_data_frames()[0]
