@@ -36,7 +36,12 @@ from nba_bot.config import (
     NBA_SERIES_ID,
     PRICE_STALE_THRESHOLD_SEC,
 )
-from nba_bot.model import predict_home_win_prob  # M4: no circular dependency
+from nba_bot.model import (
+    predict_home_win_prob,
+    predict_spread_cover_prob,
+    predict_total_over_prob,
+    predict_first_half_prob,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -372,6 +377,167 @@ def _resolve_team_outcome_mapping(game: dict, market: dict) -> dict[str, int] | 
     }
 
 
+def _parse_spread_outcomes(market: dict, game: dict) -> dict | None:
+    """
+    Parses spread market outcomes to extract spread line and outcome mapping.
+    
+    Spread markets have outcomes like:
+    - "Knicks -5.5" / "Lakers +5.5"
+    - "Home -5.5" / "Away +5.5"
+    
+    Returns dict with:
+    - spread_line: float (negative = home favored)
+    - home_outcome_idx: int (index of home team outcome)
+    - away_outcome_idx: int (index of away team outcome)
+    """
+    import re
+    outcomes = market.get("outcomes") or []
+    if len(outcomes) < 2:
+        return None
+    
+    home_aliases = _team_aliases(game, "home")
+    away_aliases = _team_aliases(game, "away")
+    
+    home_idx = None
+    away_idx = None
+    spread_line = None
+    
+    for idx, outcome in enumerate(outcomes[:2]):
+        outcome_text = _normalize_market_text(outcome)
+        
+        # Check if this outcome matches home or away team
+        is_home = _outcome_matches_team(outcome, home_aliases)
+        is_away = _outcome_matches_team(outcome, away_aliases)
+        
+        # Extract spread line from outcome text (e.g., "knicks 5.5" or "knicks 5 5")
+        # Pattern: team name followed by number (possibly with decimal or space)
+        match = re.search(r"([+-]?\s*[\d]+(?:\.\d+)?)", outcome_text)
+        if match:
+            line_str = match.group(1).replace(" ", "")
+            try:
+                line_value = float(line_str)
+            except ValueError:
+                line_value = None
+        else:
+            # Try alternate pattern: "minus 5 5" or "plus 5 5"
+            if "minus" in outcome_text or "-" in outcome_text:
+                match = re.search(r"(\d+(?:\s+\d+)?)", outcome_text)
+                if match:
+                    nums = match.group(1).replace(" ", ".")
+                    try:
+                        line_value = -float(nums)
+                    except ValueError:
+                        line_value = None
+            elif "plus" in outcome_text or "+" in outcome_text:
+                match = re.search(r"(\d+(?:\s+\d+)?)", outcome_text)
+                if match:
+                    nums = match.group(1).replace(" ", ".")
+                    try:
+                        line_value = float(nums)
+                    except ValueError:
+                        line_value = None
+                else:
+                    line_value = None
+            else:
+                line_value = None
+        
+        if is_home:
+            home_idx = idx
+            if line_value is not None:
+                spread_line = line_value
+        elif is_away:
+            away_idx = idx
+            if line_value is not None and spread_line is None:
+                # Away line is opposite of home line
+                spread_line = -line_value
+    
+    if home_idx is None or away_idx is None:
+        return None
+    
+    # If no line found, try to extract from question
+    if spread_line is None:
+        question = _normalize_market_text(market.get("question", ""))
+        match = re.search(r"([+-]?\s*[\d]+(?:\.\d+)?)", question)
+        if match:
+            line_str = match.group(1).replace(" ", "")
+            try:
+                spread_line = float(line_str)
+            except ValueError:
+                spread_line = 0.0
+        else:
+            spread_line = 0.0
+    
+    return {
+        "spread_line": spread_line,
+        "home_outcome_idx": home_idx,
+        "away_outcome_idx": away_idx,
+    }
+
+
+def _parse_total_outcomes(market: dict) -> dict | None:
+    """
+    Parses total (over/under) market outcomes to extract total line.
+    
+    Total markets have outcomes like:
+    - "Over 220.5" / "Under 220.5"
+    - "O 220.5" / "U 220.5"
+    
+    Returns dict with:
+    - total_line: float
+    - over_outcome_idx: int (index of "Over" outcome)
+    - under_outcome_idx: int (index of "Under" outcome)
+    """
+    import re
+    outcomes = market.get("outcomes") or []
+    if len(outcomes) < 2:
+        return None
+    
+    over_idx = None
+    under_idx = None
+    total_line = None
+    
+    for idx, outcome in enumerate(outcomes[:2]):
+        outcome_text = _normalize_market_text(outcome)
+        
+        # Check for over/under
+        is_over = "over" in outcome_text or outcome_text.startswith("o ")
+        is_under = "under" in outcome_text or outcome_text.startswith("u ")
+        
+        # Extract total line
+        match = re.search(r"(\d+(?:\.\d+)?)", outcome_text)
+        if match:
+            try:
+                total_line = float(match.group(1))
+            except ValueError:
+                pass
+        
+        if is_over:
+            over_idx = idx
+        elif is_under:
+            under_idx = idx
+    
+    if over_idx is None or under_idx is None:
+        return None
+    
+    # If no line found, try to extract from question
+    if total_line is None:
+        question = _normalize_market_text(market.get("question", ""))
+        match = re.search(r"(\d+(?:\.\d+)?)", question)
+        if match:
+            try:
+                total_line = float(match.group(1))
+            except ValueError:
+                total_line = 200.0
+        else:
+            total_line = 200.0
+    
+    return {
+        "total_line": total_line,
+        "over_outcome_idx": over_idx,
+        "under_outcome_idx": under_idx,
+    }
+
+
 def _load_outcome_price(token_id: str | None, fallback_price: float | None, price_cache: dict | None) -> tuple[float | None, str, float | None]:
     live_price = None
     price_source = "Gamma (cached)"
@@ -429,7 +595,16 @@ def compute_edge(
     price_cache: dict | None = None,
     hardened: bool = False,
     bankroll: float = 0.0,
-) -> list[dict]:
+    model_key: str | None = None,
+    model_label: str | None = None,
+    return_rejections: bool = False,
+    spread_model = None,
+    spread_feature_cols: list | None = None,
+    total_model = None,
+    total_feature_cols: list | None = None,
+    first_half_model = None,
+    first_half_feature_cols: list | None = None,
+) -> list[dict] | tuple[list[dict], dict]:
     """
     For a single live game, finds matching Polymarket markets, fetches the
     latest price, computes model win probability, and returns alert dicts
@@ -447,13 +622,21 @@ def compute_edge(
         hardened:     If True, applies additional risk controls (stale price checks,
                       edge calibration, liquidity-based stake caps).
         bankroll:     If > 0, applies liquidity-based stake caps.
+        spread_model:        Optional spread cover model.
+        spread_feature_cols: Feature columns for spread model.
+        total_model:         Optional total over/under model.
+        total_feature_cols:  Feature columns for total model.
+        first_half_model:    Optional first half moneyline model.
+        first_half_feature_cols: Feature columns for first half model.
 
     Returns:
         List of alert dicts (empty if no edge found or model is None).
+        If return_rejections=True, returns (alerts, rejection_counts) tuple.
     """
     if model is None:
         return []
 
+    # Compute moneyline probabilities (used for moneyline and first_half)
     home_prob = predict_home_win_prob(
         model       = model,
         feature_cols = feature_cols,
@@ -467,102 +650,357 @@ def compute_edge(
 
     matched_markets = match_game_to_markets(game, markets)
     if not matched_markets:
+        if return_rejections:
+            return [], {}
         return []
 
     alerts = []
+    rejections = {
+        "unsupported_type": 0,
+        "unresolved_mapping": 0,
+        "missing_price": 0,
+        "below_min_edge": 0,
+        "stale_quote": 0,
+        "below_hardened_liquidity": 0,
+        "zero_stake": 0,
+    }
 
     for mkt, _ in matched_markets:
         market_type = _classify_market_type(mkt.get("question", ""))
-        if market_type != "moneyline":
+        
+        # Check if market type is enabled
+        from nba_bot.config import ENABLE_SPREAD_TRADING, ENABLE_TOTAL_TRADING, ENABLE_FIRST_HALF_TRADING
+        if market_type == "spread" and not ENABLE_SPREAD_TRADING:
             if hardened:
-                logger.debug(
-                    "Skipping hardened market — unsupported market type | market_id=%s | market_type=%s | question=%s",
-                    mkt.get("market_id"),
-                    market_type,
-                    mkt.get("question", ""),
-                )
+                rejections["unsupported_type"] += 1
             continue
-
-        outcome_mapping = _resolve_team_outcome_mapping(game, mkt)
-        if outcome_mapping is None:
+        if market_type == "total" and not ENABLE_TOTAL_TRADING:
             if hardened:
-                logger.debug(
-                    "Skipping hardened market — unresolved team outcome mapping | market_id=%s | outcomes=%s | question=%s",
-                    mkt.get("market_id"),
-                    mkt.get("outcomes"),
-                    mkt.get("question", ""),
-                )
+                rejections["unsupported_type"] += 1
             continue
-
-        yes_token   = mkt.get("clob_yes_id") or mkt.get("yes_token")
-        no_token    = mkt.get("clob_no_id") or mkt.get("no_token")
-        quotes = {
-            0: _load_outcome_price(yes_token, mkt.get("yes_price"), price_cache),
-            1: _load_outcome_price(no_token, mkt.get("no_price"), price_cache),
-        }
-
-        home_index = outcome_mapping["home_index"]
-        away_index = outcome_mapping["away_index"]
-        home_price, home_price_source, home_price_timestamp = quotes[home_index]
-        away_price, away_price_source, away_price_timestamp = quotes[away_index]
-
-        if home_price is None or away_price is None:
+        if market_type == "first_half" and not ENABLE_FIRST_HALF_TRADING:
             if hardened:
-                logger.debug(
-                    "Skipping hardened market — missing live outcome price | market_id=%s | home_price=%s | away_price=%s | question=%s",
-                    mkt.get("market_id"),
-                    home_price,
-                    away_price,
-                    mkt.get("question", ""),
-                )
+                rejections["unsupported_type"] += 1
             continue
+        
+        # ── SPREAD MARKETS ──
+        if market_type == "spread":
+            if spread_model is None:
+                if hardened:
+                    rejections["unsupported_type"] += 1
+                continue
+            
+            spread_info = _parse_spread_outcomes(mkt, game)
+            if spread_info is None:
+                if hardened:
+                    rejections["unresolved_mapping"] += 1
+                continue
+            
+            spread_line = spread_info["spread_line"]
+            home_idx = spread_info["home_outcome_idx"]
+            away_idx = spread_info["away_outcome_idx"]
+            
+            # Compute cover probability
+            cover_prob = predict_spread_cover_prob(
+                model=spread_model,
+                feature_cols=spread_feature_cols,
+                spread_line=spread_line,
+                home_score=game["home_score"],
+                away_score=game["away_score"],
+                period=game["period"],
+                clock=game["clock"],
+                advanced_ctx=advanced_ctx,
+            )
+            not_cover_prob = 1.0 - cover_prob
+            
+            # Load prices
+            yes_token = mkt.get("clob_yes_id") or mkt.get("yes_token")
+            no_token = mkt.get("clob_no_id") or mkt.get("no_token")
+            quotes = {
+                0: _load_outcome_price(yes_token, mkt.get("yes_price"), price_cache),
+                1: _load_outcome_price(no_token, mkt.get("no_price"), price_cache),
+            }
+            home_price, home_price_source, home_price_timestamp = quotes[home_idx]
+            away_price, away_price_source, away_price_timestamp = quotes[away_idx]
+            
+            if home_price is None or away_price is None:
+                if hardened:
+                    rejections["missing_price"] += 1
+                continue
+            
+            
+            candidates = [
+                {
+                    "team_side": "home",
+                    "outcome_index": home_idx,
+                    "model_prob": cover_prob,
+                    "market_price": home_price,
+                    "price_source": home_price_source,
+                    "price_timestamp": home_price_timestamp,
+                    "edge": cover_prob - home_price,
+                },
+                {
+                    "team_side": "away",
+                    "outcome_index": away_idx,
+                    "model_prob": not_cover_prob,
+                    "market_price": away_price,
+                    "price_source": away_price_source,
+                    "price_timestamp": away_price_timestamp,
+                    "edge": not_cover_prob - away_price,
+                },
+            ]
+            candidates = [c for c in candidates if c["edge"] >= MIN_EDGE]
+            if not candidates:
+                if hardened:
+                    rejections["below_min_edge"] += 1
+                continue
+            
+            selected = max(candidates, key=lambda c: c["edge"])
+            model_prob = selected["model_prob"]
+            selected_price = selected["market_price"]
+            price_source = selected["price_source"]
+            price_timestamp = selected["price_timestamp"]
+            edge = selected["edge"]
+            selected_outcome_index = selected["outcome_index"]
+            trade_token = yes_token if selected_outcome_index == 0 else no_token
+            direction = "BUY YES" if selected_outcome_index == 0 else "BUY NO"
+            market_label_suffix = f" (spread {spread_line})"
+        
+        # ── TOTAL MARKETS ──
+        elif market_type == "total":
+            if total_model is None:
+                if hardened:
+                    rejections["unsupported_type"] += 1
+                continue
+            
+            
+            total_info = _parse_total_outcomes(mkt)
+            if total_info is None:
+                if hardened:
+                    rejections["unresolved_mapping"] += 1
+                continue
+            
+            
+            total_line = total_info["total_line"]
+            over_idx = total_info["over_outcome_idx"]
+            under_idx = total_info["under_outcome_idx"]
+            
+            # Compute over probability
+            over_prob = predict_total_over_prob(
+                model=total_model,
+                feature_cols=total_feature_cols,
+                total_line=total_line,
+                home_score=game["home_score"],
+                away_score=game["away_score"],
+                period=game["period"],
+                clock=game["clock"],
+                advanced_ctx=advanced_ctx,
+            )
+            under_prob = 1.0 - over_prob
+            
+            # Load prices
+            yes_token = mkt.get("clob_yes_id") or mkt.get("yes_token")
+            no_token = mkt.get("clob_no_id") or mkt.get("no_token")
+            quotes = {
+                0: _load_outcome_price(yes_token, mkt.get("yes_price"), price_cache),
+                1: _load_outcome_price(no_token, mkt.get("no_price"), price_cache),
+            }
+            over_price, over_price_source, over_price_timestamp = quotes[over_idx]
+            under_price, under_price_source, under_price_timestamp = quotes[under_idx]
+            
+            if over_price is None or under_price is None:
+                if hardened:
+                    rejections["missing_price"] += 1
+                continue
+            
+            
+            candidates = [
+                {
+                    "team_side": "over",
+                    "outcome_index": over_idx,
+                    "model_prob": over_prob,
+                    "market_price": over_price,
+                    "price_source": over_price_source,
+                    "price_timestamp": over_price_timestamp,
+                    "edge": over_prob - over_price,
+                },
+                {
+                    "team_side": "under",
+                    "outcome_index": under_idx,
+                    "model_prob": under_prob,
+                    "market_price": under_price,
+                    "price_source": under_price_source,
+                    "price_timestamp": under_price_timestamp,
+                    "edge": under_prob - under_price,
+                },
+            ]
+            candidates = [c for c in candidates if c["edge"] >= MIN_EDGE]
+            if not candidates:
+                if hardened:
+                    rejections["below_min_edge"] += 1
+                continue
+            
+            selected = max(candidates, key=lambda c: c["edge"])
+            model_prob = selected["model_prob"]
+            selected_price = selected["market_price"]
+            price_source = selected["price_source"]
+            price_timestamp = selected["price_timestamp"]
+            edge = selected["edge"]
+            selected_outcome_index = selected["outcome_index"]
+            trade_token = yes_token if selected_outcome_index == 0 else no_token
+            direction = "BUY YES" if selected_outcome_index == 0 else "BUY NO"
+            market_label_suffix = f" (total {total_line})"
+        
+        
+        # ── FIRST HALF MARKETS ──
+        elif market_type == "first_half":
+            if first_half_model is None:
+                if hardened:
+                    rejections["unsupported_type"] += 1
+                continue
+            
+            # First half uses same outcome mapping as moneyline
+            outcome_mapping = _resolve_team_outcome_mapping(game, mkt)
+            if outcome_mapping is None:
+                if hardened:
+                    rejections["unresolved_mapping"] += 1
+                continue
+            
+            # Compute first half win probability
+            fh_home_prob = predict_first_half_prob(
+                model=first_half_model,
+                feature_cols=first_half_feature_cols,
+                home_score=game["home_score"],
+                away_score=game["away_score"],
+                period=game["period"],
+                clock=game["clock"],
+                advanced_ctx=advanced_ctx,
+            )
+            fh_away_prob = 1.0 - fh_home_prob
+            
+            # Load prices
+            yes_token = mkt.get("clob_yes_id") or mkt.get("yes_token")
+            no_token = mkt.get("clob_no_id") or mkt.get("no_token")
+            home_index = outcome_mapping["home_index"]
+            away_index = outcome_mapping["away_index"]
+            quotes = {
+                0: _load_outcome_price(yes_token, mkt.get("yes_price"), price_cache),
+                1: _load_outcome_price(no_token, mkt.get("no_price"), price_cache),
+            }
+            home_price, home_price_source, home_price_timestamp = quotes[home_index]
+            away_price, away_price_source, away_price_timestamp = quotes[away_index]
+            
+            if home_price is None or away_price is None:
+                if hardened:
+                    rejections["missing_price"] += 1
+                continue
+            
+            
+            candidates = [
+                {
+                    "team_side": "home",
+                    "outcome_index": home_index,
+                    "model_prob": fh_home_prob,
+                    "market_price": home_price,
+                    "price_source": home_price_source,
+                    "price_timestamp": home_price_timestamp,
+                    "edge": fh_home_prob - home_price,
+                },
+                {
+                    "team_side": "away",
+                    "outcome_index": away_index,
+                    "model_prob": fh_away_prob,
+                    "market_price": away_price,
+                    "price_source": away_price_source,
+                    "price_timestamp": away_price_timestamp,
+                    "edge": fh_away_prob - away_price,
+                },
+            ]
+            candidates = [c for c in candidates if c["edge"] >= MIN_EDGE]
+            if not candidates:
+                if hardened:
+                    rejections["below_min_edge"] += 1
+                continue
+            
+            selected = max(candidates, key=lambda c: c["edge"])
+            model_prob = selected["model_prob"]
+            selected_price = selected["market_price"]
+            price_source = selected["price_source"]
+            price_timestamp = selected["price_timestamp"]
+            edge = selected["edge"]
+            selected_outcome_index = selected["outcome_index"]
+            trade_token = yes_token if selected_outcome_index == 0 else no_token
+            direction = "BUY YES" if selected_outcome_index == 0 else "BUY NO"
+            market_label_suffix = " (1H)"
+        
+        
+        # ── MONEYLINE MARKETS ──
+        else:
+            outcome_mapping = _resolve_team_outcome_mapping(game, mkt)
+            if outcome_mapping is None:
+                if hardened:
+                    rejections["unresolved_mapping"] += 1
+                continue
 
-        candidates = [
-            {
-                "team_side": "home",
-                "outcome_index": home_index,
-                "model_prob": home_prob,
-                "market_price": home_price,
-                "price_source": home_price_source,
-                "price_timestamp": home_price_timestamp,
-                "edge": home_prob - home_price,
-            },
-            {
-                "team_side": "away",
-                "outcome_index": away_index,
-                "model_prob": away_prob,
-                "market_price": away_price,
-                "price_source": away_price_source,
-                "price_timestamp": away_price_timestamp,
-                "edge": away_prob - away_price,
-            },
-        ]
-        candidates = [candidate for candidate in candidates if candidate["edge"] >= MIN_EDGE]
-        if not candidates:
-            if hardened:
-                best_edge = max(home_prob - home_price, away_prob - away_price)
-                logger.debug(
-                    "Skipping hardened market — below min edge after outcome mapping | market_id=%s | best_edge=%.4f | threshold=%.4f | question=%s",
-                    mkt.get("market_id"),
-                    best_edge,
-                    MIN_EDGE,
-                    mkt.get("question", ""),
-                )
-            continue
+            yes_token = mkt.get("clob_yes_id") or mkt.get("yes_token")
+            no_token = mkt.get("clob_no_id") or mkt.get("no_token")
+            quotes = {
+                0: _load_outcome_price(yes_token, mkt.get("yes_price"), price_cache),
+                1: _load_outcome_price(no_token, mkt.get("no_price"), price_cache),
+            }
 
-        selected = max(candidates, key=lambda candidate: candidate["edge"])
-        model_prob = selected["model_prob"]
-        selected_price = selected["market_price"]
-        price_source = selected["price_source"]
-        price_timestamp = selected["price_timestamp"]
-        edge = selected["edge"]
-        selected_outcome_index = selected["outcome_index"]
-        trade_token = yes_token if selected_outcome_index == 0 else no_token
-        direction = "BUY YES" if selected_outcome_index == 0 else "BUY NO"
+            home_index = outcome_mapping["home_index"]
+            away_index = outcome_mapping["away_index"]
+            home_price, home_price_source, home_price_timestamp = quotes[home_index]
+            away_price, away_price_source, away_price_timestamp = quotes[away_index]
 
+            if home_price is None or away_price is None:
+                if hardened:
+                    rejections["missing_price"] += 1
+                continue
+
+            candidates = [
+                {
+                    "team_side": "home",
+                    "outcome_index": home_index,
+                    "model_prob": home_prob,
+                    "market_price": home_price,
+                    "price_source": home_price_source,
+                    "price_timestamp": home_price_timestamp,
+                    "edge": home_prob - home_price,
+                },
+                {
+                    "team_side": "away",
+                    "outcome_index": away_index,
+                    "model_prob": away_prob,
+                    "market_price": away_price,
+                    "price_source": away_price_source,
+                    "price_timestamp": away_price_timestamp,
+                    "edge": away_prob - away_price,
+                },
+            ]
+            candidates = [c for c in candidates if c["edge"] >= MIN_EDGE]
+            if not candidates:
+                if hardened:
+                    rejections["below_min_edge"] += 1
+                continue
+
+            selected = max(candidates, key=lambda c: c["edge"])
+            model_prob = selected["model_prob"]
+            selected_price = selected["market_price"]
+            price_source = selected["price_source"]
+            price_timestamp = selected["price_timestamp"]
+            edge = selected["edge"]
+            selected_outcome_index = selected["outcome_index"]
+            trade_token = yes_token if selected_outcome_index == 0 else no_token
+            direction = "BUY YES" if selected_outcome_index == 0 else "BUY NO"
+            market_label_suffix = ""
+
+        # Common hardened checks for all market types
         if hardened:
             price_age = None if price_timestamp is None else (time.time() - price_timestamp)
             if price_age is None or price_age > PRICE_STALE_THRESHOLD_SEC:
+                rejections["stale_quote"] += 1
                 logger.info(
                     "Skipping hardened market — stale quote | market_id=%s | source=%s | age=%s | threshold=%ss | question=%s",
                     mkt.get("market_id"),
@@ -585,6 +1023,7 @@ def compute_edge(
         liquidity = float(mkt.get("liquidity", 0) or 0)
         if hardened:
             if liquidity < HARDENED_MIN_LIQUIDITY:
+                rejections["below_hardened_liquidity"] += 1
                 logger.debug(
                     "Skipping hardened market — below hardened liquidity | market_id=%s | liquidity=%.2f | threshold=%s | question=%s",
                     mkt.get("market_id"),
@@ -603,6 +1042,7 @@ def compute_edge(
 
         if stake <= 0:
             if hardened:
+                rejections["zero_stake"] += 1
                 logger.debug(
                     "Skipping hardened market — zero stake after caps | market_id=%s | liquidity=%.2f | bankroll=%.2f | question=%s",
                     mkt.get("market_id"),
@@ -618,9 +1058,12 @@ def compute_edge(
             "score":        f"{game['away_score']}-{game['home_score']}",
             "period":       game["period"],
             "clock":        game["clock"],
-            "market":       mkt["question"],
+            "market":       mkt["question"] + market_label_suffix,
+            "market_type":  market_type,
             "market_id":    mkt["market_id"],
             "event_slug":   mkt["event_slug"],
+            "model_key":    model_key,
+            "model_label":  model_label,
             "model_prob":   round(model_prob, 4),
             "poly_price":   round(selected_price, 4),
             "enter_price":  enter_price,
@@ -641,6 +1084,8 @@ def compute_edge(
             "url":          mkt["url"],
         })
 
+    if return_rejections:
+        return alerts, rejections
     return alerts
 
 
@@ -652,11 +1097,14 @@ def print_alert(alert: dict):
     """Pretty-prints a single edge alert to the console."""
     edge_val = alert["edge"]
     bar      = "▲" if edge_val > 0 else "▼"
+    model_label = alert.get("model_label")
 
     print()
     print("  ╔══════════════════════════════════════════════════╗")
     print(f"  ║  EDGE ALERT  {alert['timestamp']}")
     print("  ╚══════════════════════════════════════════════════╝")
+    if model_label:
+        print(f"  Model:        {model_label}")
     print(f"  Game:         {alert['game']}")
     print(f"  Score:        {alert['score']}  |  Q{alert['period']}  {alert['clock']}")
     print(f"  Market:       {alert['market']}")
@@ -670,8 +1118,37 @@ def print_alert(alert: dict):
     print()
 
 
-def print_no_edge(n_games: int, n_markets: int):
-    """Prints a one-line summary when no edge was found in a scan."""
+def print_no_edge(n_games: int, n_markets: int, rejections: dict | None = None):
+    """Prints a one-line summary when no edge was found in a scan.
+    
+    If rejections dict is provided (hardened mode), shows why markets were filtered.
+    """
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"  [{ts}] Scanned {n_games} game(s) across {n_markets} market(s) "
-          f"— no edge >= {MIN_EDGE * 100:.0f}%")
+    base_msg = f"  [{ts}] Scanned {n_games} game(s) across {n_markets} market(s) — no edge >= {MIN_EDGE * 100:.0f}%"
+    
+    if not rejections or not any(rejections.values()):
+        print(base_msg)
+        return
+    
+    # Show hardened filter breakdown
+    total_rejected = sum(rejections.values())
+    parts = []
+    if rejections.get("below_min_edge"):
+        parts.append(f"below_threshold={rejections['below_min_edge']}")
+    if rejections.get("stale_quote"):
+        parts.append(f"stale_quote={rejections['stale_quote']}")
+    if rejections.get("below_hardened_liquidity"):
+        parts.append(f"low_liquidity={rejections['below_hardened_liquidity']}")
+    if rejections.get("missing_price"):
+        parts.append(f"missing_price={rejections['missing_price']}")
+    if rejections.get("unresolved_mapping"):
+        parts.append(f"unresolved={rejections['unresolved_mapping']}")
+    if rejections.get("unsupported_type"):
+        parts.append(f"unsupported_type={rejections['unsupported_type']}")
+    if rejections.get("zero_stake"):
+        parts.append(f"zero_stake={rejections['zero_stake']}")
+    
+    if parts:
+        print(f"{base_msg} (hardened filters: {', '.join(parts)})")
+    else:
+        print(base_msg)

@@ -397,3 +397,497 @@ def compute_features(
     ]
 
     return np.array([t1_values + t2_values], dtype=float)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spread model training rows
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_spread_rows(
+    df_nbastats: pd.DataFrame,
+    df_pbpstats: pd.DataFrame | None = None,
+    player_ratings: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Builds training rows for spread cover model.
+    
+    Each row represents a game state with:
+    - T1/T2 features
+    - spread_line (the line to cover)
+    - current_score_diff
+    - covered_spread (target: 1 if home covered, 0 otherwise)
+    
+    Note: Uses final game margin to determine if spread was covered.
+    For live training, this is the ground truth label.
+    """
+    if df_nbastats is None or df_nbastats.empty:
+        logger.warning("build_spread_rows: df_nbastats is empty")
+        return pd.DataFrame()
+    
+    # First build base rows using moneyline logic
+    df = df_nbastats.copy()
+    df.columns = [c.upper() for c in df.columns]
+    
+    # Build pbpstats lookup for Tier 2
+    pbp_lookup = None
+    if df_pbpstats is not None:
+        pbp = df_pbpstats.copy()
+        pbp.columns = [c.upper() for c in pbp.columns]
+        if "PCTIMESTRING" not in pbp.columns and "STARTTIME" in pbp.columns:
+            pbp = pbp.rename(columns={"STARTTIME": "PCTIMESTRING"})
+        if "PCTIMESTRING" in pbp.columns:
+            pbp["_secs"] = pbp["PCTIMESTRING"].apply(lambda x: _to_secs(x) if pd.notna(x) else 0)
+        pbp_lookup = pbp
+    
+    all_rows = []
+    
+    for game_id, game_df in df.groupby("GAME_ID"):
+        game_df = game_df.sort_values(["PERIOD", "PCTIMESTRING"], ascending=[True, False])
+        game_rows = []
+        
+        # O(1) lookup map for PBP
+        pbp_map = {}
+        if pbp_lookup is not None:
+            game_pbp = pbp_lookup[pbp_lookup["GAME_ID"] == game_id]
+            for _, r in game_pbp.iterrows():
+                period_val = r.get("PERIOD")
+                secs_val = r.get("_secs", 0)
+                st_val = r.get("STARTTYPE")
+                if pd.notna(period_val):
+                    p_num = int(period_val)
+                    if p_num not in pbp_map:
+                        pbp_map[p_num] = []
+                    pbp_map[p_num].append((secs_val, st_val))
+        
+        # Determine team IDs
+        home_team_id = None
+        away_team_id = None
+        for col in ["HOME_TEAM_ID", "HTEAM_ID", "HOME_ID"]:
+            if col in game_df.columns:
+                home_team_id = game_df[col].dropna().iloc[0] if not game_df[col].dropna().empty else None
+                break
+        for col in ["VISITOR_TEAM_ID", "VTEAM_ID", "AWAY_ID"]:
+            if col in game_df.columns:
+                away_team_id = game_df[col].dropna().iloc[0] if not game_df[col].dropna().empty else None
+                break
+        if home_team_id is None and "HOMEDESCRIPTION" in game_df.columns and "PLAYER1_TEAM_ID" in game_df.columns:
+            mask = game_df["HOMEDESCRIPTION"].notna() & game_df["PLAYER1_TEAM_ID"].notna()
+            candidates = game_df.loc[mask, "PLAYER1_TEAM_ID"]
+            if not candidates.empty:
+                home_team_id = candidates.iloc[0]
+        if away_team_id is None and "VISITORDESCRIPTION" in game_df.columns and "PLAYER1_TEAM_ID" in game_df.columns:
+            mask = game_df["VISITORDESCRIPTION"].notna() & game_df["PLAYER1_TEAM_ID"].notna()
+            candidates = game_df.loc[mask, "PLAYER1_TEAM_ID"]
+            if not candidates.empty:
+                away_team_id = candidates.iloc[0]
+        
+        # Player quality from ratings dict
+        player_quality_home = 0.0
+        player_quality_away = 0.0
+        if player_ratings:
+            if home_team_id is not None:
+                player_quality_home = player_ratings.get(int(home_team_id), 0.0)
+            if away_team_id is not None:
+                player_quality_away = player_ratings.get(int(away_team_id), 0.0)
+        
+        # Build per-play rows
+        home_score = 0
+        away_score = 0
+        
+        for _, play in game_df.iterrows():
+            score_str = play.get("SCORE", None)
+            if pd.notna(score_str) and " - " in str(score_str):
+                try:
+                    away_score, home_score = map(int, str(score_str).split(" - "))
+                except Exception:
+                    pass
+            
+            period = int(play.get("PERIOD", 1))
+            clock = str(play.get("PCTIMESTRING", "12:00"))
+            
+            time_remaining = _parse_clock(period, clock)
+            score_diff = home_score - away_score
+            
+            row = _compute_t1(score_diff, time_remaining, period)
+            row["game_id"] = game_id
+            row["current_score_diff"] = float(score_diff)
+            
+            # T2 features
+            starttype_encoded = STARTTYPE_FALLBACK
+            if period in pbp_map:
+                try:
+                    play_secs = _to_secs(clock)
+                    for p_secs, p_type in pbp_map[period]:
+                        if abs(p_secs - play_secs) <= 2:
+                            starttype_encoded = _encode_starttype(str(p_type))
+                            break
+                except Exception:
+                    starttype_encoded = STARTTYPE_FALLBACK
+            
+            row["starttype_encoded"] = starttype_encoded
+            row["player_quality_home"] = player_quality_home
+            row["player_quality_away"] = player_quality_away
+            
+            # Placeholder spread_line (will be set at inference time from market)
+            # For training, we use a range of common spread values to teach the model
+            # how different lines affect cover probability
+            for spread_line in [-7.5, -5.5, -3.5, -2.5, -1.5, 0, 1.5, 2.5, 3.5, 5.5, 7.5]:
+                row_copy = row.copy()
+                row_copy["spread_line"] = float(spread_line)
+                game_rows.append(row_copy)
+        
+        # Determine final margin for target
+        final_margin = home_score - away_score
+        
+        # Assign covered_spread target to each row
+        for r in game_rows:
+            spread_line = r["spread_line"]
+            # Home covers if home_score - away_score > spread_line
+            # (e.g., spread_line = -5.5, home wins by 6 → covered)
+            r["covered_spread"] = int(final_margin > spread_line)
+        
+        all_rows.extend(game_rows)
+    
+    if not all_rows:
+        logger.warning("build_spread_rows: no rows produced")
+        return pd.DataFrame()
+    
+    result_df = pd.DataFrame(all_rows)
+    from nba_bot.config import FEATURES_SPREAD
+    extra_cols = ["covered_spread", "game_id"]
+    ordered_cols = [c for c in FEATURES_SPREAD + extra_cols if c in result_df.columns]
+    result_df = result_df[ordered_cols]
+    
+    logger.info(
+        "build_spread_rows: %d rows, %d games",
+        len(result_df),
+        result_df["game_id"].nunique(),
+    )
+    return result_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Total model training rows
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_total_rows(
+    df_nbastats: pd.DataFrame,
+    df_pbpstats: pd.DataFrame | None = None,
+    player_ratings: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Builds training rows for total over/under model.
+    
+    Each row represents a game state with:
+    - T1/T2 features
+    - total_line (the line to exceed)
+    - current_total (points scored so far)
+    - pace (current_total / elapsed_time)
+    - went_over (target: 1 if final total > total_line, 0 otherwise)
+    """
+    if df_nbastats is None or df_nbastats.empty:
+        logger.warning("build_total_rows: df_nbastats is empty")
+        return pd.DataFrame()
+    
+    df = df_nbastats.copy()
+    df.columns = [c.upper() for c in df.columns]
+    
+    # Build pbpstats lookup for Tier 2
+    pbp_lookup = None
+    if df_pbpstats is not None:
+        pbp = df_pbpstats.copy()
+        pbp.columns = [c.upper() for c in pbp.columns]
+        if "PCTIMESTRING" not in pbp.columns and "STARTTIME" in pbp.columns:
+            pbp = pbp.rename(columns={"STARTTIME": "PCTIMESTRING"})
+        if "PCTIMESTRING" in pbp.columns:
+            pbp["_secs"] = pbp["PCTIMESTRING"].apply(lambda x: _to_secs(x) if pd.notna(x) else 0)
+        pbp_lookup = pbp
+    
+    all_rows = []
+    
+    for game_id, game_df in df.groupby("GAME_ID"):
+        game_df = game_df.sort_values(["PERIOD", "PCTIMESTRING"], ascending=[True, False])
+        game_rows = []
+        
+        # O(1) lookup map for PBP
+        pbp_map = {}
+        if pbp_lookup is not None:
+            game_pbp = pbp_lookup[pbp_lookup["GAME_ID"] == game_id]
+            for _, r in game_pbp.iterrows():
+                period_val = r.get("PERIOD")
+                secs_val = r.get("_secs", 0)
+                st_val = r.get("STARTTYPE")
+                if pd.notna(period_val):
+                    p_num = int(period_val)
+                    if p_num not in pbp_map:
+                        pbp_map[p_num] = []
+                    pbp_map[p_num].append((secs_val, st_val))
+        
+        # Determine team IDs
+        home_team_id = None
+        away_team_id = None
+        for col in ["HOME_TEAM_ID", "HTEAM_ID", "HOME_ID"]:
+            if col in game_df.columns:
+                home_team_id = game_df[col].dropna().iloc[0] if not game_df[col].dropna().empty else None
+                break
+        for col in ["VISITOR_TEAM_ID", "VTEAM_ID", "AWAY_ID"]:
+            if col in game_df.columns:
+                away_team_id = game_df[col].dropna().iloc[0] if not game_df[col].dropna().empty else None
+                break
+        if home_team_id is None and "HOMEDESCRIPTION" in game_df.columns and "PLAYER1_TEAM_ID" in game_df.columns:
+            mask = game_df["HOMEDESCRIPTION"].notna() & game_df["PLAYER1_TEAM_ID"].notna()
+            candidates = game_df.loc[mask, "PLAYER1_TEAM_ID"]
+            if not candidates.empty:
+                home_team_id = candidates.iloc[0]
+        if away_team_id is None and "VISITORDESCRIPTION" in game_df.columns and "PLAYER1_TEAM_ID" in game_df.columns:
+            mask = game_df["VISITORDESCRIPTION"].notna() & game_df["PLAYER1_TEAM_ID"].notna()
+            candidates = game_df.loc[mask, "PLAYER1_TEAM_ID"]
+            if not candidates.empty:
+                away_team_id = candidates.iloc[0]
+        
+        # Player quality from ratings dict
+        player_quality_home = 0.0
+        player_quality_away = 0.0
+        if player_ratings:
+            if home_team_id is not None:
+                player_quality_home = player_ratings.get(int(home_team_id), 0.0)
+            if away_team_id is not None:
+                player_quality_away = player_ratings.get(int(away_team_id), 0.0)
+        
+        # Build per-play rows
+        home_score = 0
+        away_score = 0
+        
+        for _, play in game_df.iterrows():
+            score_str = play.get("SCORE", None)
+            if pd.notna(score_str) and " - " in str(score_str):
+                try:
+                    away_score, home_score = map(int, str(score_str).split(" - "))
+                except Exception:
+                    pass
+            
+            period = int(play.get("PERIOD", 1))
+            clock = str(play.get("PCTIMESTRING", "12:00"))
+            
+            time_remaining = _parse_clock(period, clock)
+            score_diff = home_score - away_score
+            current_total = home_score + away_score
+            
+            # Compute pace: points per second
+            elapsed_time = 2880 - time_remaining  # total seconds elapsed
+            pace = current_total / max(elapsed_time, 1)  # avoid div by 0
+            
+            row = _compute_t1(score_diff, time_remaining, period)
+            row["game_id"] = game_id
+            row["current_total"] = float(current_total)
+            row["pace"] = float(pace)
+            
+            # T2 features
+            starttype_encoded = STARTTYPE_FALLBACK
+            if period in pbp_map:
+                try:
+                    play_secs = _to_secs(clock)
+                    for p_secs, p_type in pbp_map[period]:
+                        if abs(p_secs - play_secs) <= 2:
+                            starttype_encoded = _encode_starttype(str(p_type))
+                            break
+                except Exception:
+                    starttype_encoded = STARTTYPE_FALLBACK
+            
+            row["starttype_encoded"] = starttype_encoded
+            row["player_quality_home"] = player_quality_home
+            row["player_quality_away"] = player_quality_away
+            
+            # Train on common total lines
+            for total_line in [200.5, 210.5, 215.5, 220.5, 225.5, 230.5, 235.5, 240.5]:
+                row_copy = row.copy()
+                row_copy["total_line"] = float(total_line)
+                game_rows.append(row_copy)
+        
+        # Determine final total for target
+        final_total = home_score + away_score
+        
+        # Assign went_over target to each row
+        for r in game_rows:
+            total_line = r["total_line"]
+            r["went_over"] = int(final_total > total_line)
+        
+        all_rows.extend(game_rows)
+    
+    if not all_rows:
+        logger.warning("build_total_rows: no rows produced")
+        return pd.DataFrame()
+    
+    result_df = pd.DataFrame(all_rows)
+    from nba_bot.config import FEATURES_TOTAL
+    extra_cols = ["went_over", "game_id"]
+    ordered_cols = [c for c in FEATURES_TOTAL + extra_cols if c in result_df.columns]
+    result_df = result_df[ordered_cols]
+    
+    logger.info(
+        "build_total_rows: %d rows, %d games",
+        len(result_df),
+        result_df["game_id"].nunique(),
+    )
+    return result_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# First half model training rows
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_first_half_rows(
+    df_nbastats: pd.DataFrame,
+    df_pbpstats: pd.DataFrame | None = None,
+    player_ratings: dict | None = None,
+) -> pd.DataFrame:
+    """
+    Builds training rows for first half moneyline model.
+    
+    Only uses plays from periods 1-2 (first half).
+    Target is home_win at halftime.
+    """
+    if df_nbastats is None or df_nbastats.empty:
+        logger.warning("build_first_half_rows: df_nbastats is empty")
+        return pd.DataFrame()
+    
+    df = df_nbastats.copy()
+    df.columns = [c.upper() for c in df.columns]
+    
+    # Filter to first half only (periods 1 and 2)
+    df = df[df["PERIOD"].isin([1, 2])]
+    
+    if df.empty:
+        logger.warning("build_first_half_rows: no first half plays found")
+        return pd.DataFrame()
+    
+    # Build pbpstats lookup for Tier 2
+    pbp_lookup = None
+    if df_pbpstats is not None:
+        pbp = df_pbpstats.copy()
+        pbp.columns = [c.upper() for c in pbp.columns]
+        if "PCTIMESTRING" not in pbp.columns and "STARTTIME" in pbp.columns:
+            pbp = pbp.rename(columns={"STARTTIME": "PCTIMESTRING"})
+        if "PCTIMESTRING" in pbp.columns:
+            pbp["_secs"] = pbp["PCTIMESTRING"].apply(lambda x: _to_secs(x) if pd.notna(x) else 0)
+        pbp_lookup = pbp
+    
+    all_rows = []
+    
+    for game_id, game_df in df.groupby("GAME_ID"):
+        game_df = game_df.sort_values(["PERIOD", "PCTIMESTRING"], ascending=[True, False])
+        game_rows = []
+        
+        # O(1) lookup map for PBP
+        pbp_map = {}
+        if pbp_lookup is not None:
+            game_pbp = pbp_lookup[pbp_lookup["GAME_ID"] == game_id]
+            for _, r in game_pbp.iterrows():
+                period_val = r.get("PERIOD")
+                secs_val = r.get("_secs", 0)
+                st_val = r.get("STARTTYPE")
+                if pd.notna(period_val) and int(period_val) in [1, 2]:
+                    p_num = int(period_val)
+                    if p_num not in pbp_map:
+                        pbp_map[p_num] = []
+                    pbp_map[p_num].append((secs_val, st_val))
+        
+        # Determine team IDs
+        home_team_id = None
+        away_team_id = None
+        for col in ["HOME_TEAM_ID", "HTEAM_ID", "HOME_ID"]:
+            if col in game_df.columns:
+                home_team_id = game_df[col].dropna().iloc[0] if not game_df[col].dropna().empty else None
+                break
+        for col in ["VISITOR_TEAM_ID", "VTEAM_ID", "AWAY_ID"]:
+            if col in game_df.columns:
+                away_team_id = game_df[col].dropna().iloc[0] if not game_df[col].dropna().empty else None
+                break
+        if home_team_id is None and "HOMEDESCRIPTION" in game_df.columns and "PLAYER1_TEAM_ID" in game_df.columns:
+            mask = game_df["HOMEDESCRIPTION"].notna() & game_df["PLAYER1_TEAM_ID"].notna()
+            candidates = game_df.loc[mask, "PLAYER1_TEAM_ID"]
+            if not candidates.empty:
+                home_team_id = candidates.iloc[0]
+        if away_team_id is None and "VISITORDESCRIPTION" in game_df.columns and "PLAYER1_TEAM_ID" in game_df.columns:
+            mask = game_df["VISITORDESCRIPTION"].notna() & game_df["PLAYER1_TEAM_ID"].notna()
+            candidates = game_df.loc[mask, "PLAYER1_TEAM_ID"]
+            if not candidates.empty:
+                away_team_id = candidates.iloc[0]
+        
+        # Player quality from ratings dict
+        player_quality_home = 0.0
+        player_quality_away = 0.0
+        if player_ratings:
+            if home_team_id is not None:
+                player_quality_home = player_ratings.get(int(home_team_id), 0.0)
+            if away_team_id is not None:
+                player_quality_away = player_ratings.get(int(away_team_id), 0.0)
+        
+        # Build per-play rows
+        home_score = 0
+        away_score = 0
+        halftime_home_score = 0
+        halftime_away_score = 0
+        
+        for _, play in game_df.iterrows():
+            score_str = play.get("SCORE", None)
+            if pd.notna(score_str) and " - " in str(score_str):
+                try:
+                    away_score, home_score = map(int, str(score_str).split(" - "))
+                except Exception:
+                    pass
+            
+            period = int(play.get("PERIOD", 1))
+            clock = str(play.get("PCTIMESTRING", "12:00"))
+            
+            # Track halftime score (last play of period 2)
+            if period == 2:
+                halftime_home_score = home_score
+                halftime_away_score = away_score
+            
+            time_remaining = _parse_clock(period, clock)
+            score_diff = home_score - away_score
+            
+            row = _compute_t1(score_diff, time_remaining, period)
+            row["game_id"] = game_id
+            
+            # T2 features
+            starttype_encoded = STARTTYPE_FALLBACK
+            if period in pbp_map:
+                try:
+                    play_secs = _to_secs(clock)
+                    for p_secs, p_type in pbp_map[period]:
+                        if abs(p_secs - play_secs) <= 2:
+                            starttype_encoded = _encode_starttype(str(p_type))
+                            break
+                except Exception:
+                    starttype_encoded = STARTTYPE_FALLBACK
+            
+            row["starttype_encoded"] = starttype_encoded
+            row["player_quality_home"] = player_quality_home
+            row["player_quality_away"] = player_quality_away
+            
+            game_rows.append(row)
+        
+        # Determine first half winner
+        home_win_halftime = int(halftime_home_score > halftime_away_score)
+        for r in game_rows:
+            r["home_win"] = home_win_halftime
+        all_rows.extend(game_rows)
+    
+    if not all_rows:
+        logger.warning("build_first_half_rows: no rows produced")
+        return pd.DataFrame()
+    
+    result_df = pd.DataFrame(all_rows)
+    from nba_bot.config import FEATURES_FIRST_HALF
+    extra_cols = ["home_win", "game_id"]
+    ordered_cols = [c for c in FEATURES_FIRST_HALF + extra_cols if c in result_df.columns]
+    result_df = result_df[ordered_cols]
+    
+    logger.info(
+        "build_first_half_rows: %d rows, %d games",
+        len(result_df),
+        result_df["game_id"].nunique(),
+    )
+    return result_df

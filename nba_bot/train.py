@@ -52,14 +52,49 @@ def main():
         action="store_true",
         help="Train Tier-2 model with pbpstats data and team ratings features",
     )
+    parser.add_argument(
+        "--spread",
+        action="store_true",
+        help="Train spread cover model (requires --advanced)",
+    )
+    parser.add_argument(
+        "--total",
+        action="store_true",
+        help="Train total over/under model (requires --advanced)",
+    )
+    parser.add_argument(
+        "--first-half",
+        dest="first_half",
+        action="store_true",
+        help="Train first half moneyline model (requires --advanced)",
+    )
 
     args = parser.parse_args()
 
     # Validate output directory
     os.makedirs(args.output_path, exist_ok=True)
 
+    # Determine model type
+    model_type = "moneyline"
+    if args.spread:
+        model_type = "spread"
+        if not args.advanced:
+            logger.error("--spread requires --advanced for T2 features")
+            sys.exit(1)
+    elif args.total:
+        model_type = "total"
+        if not args.advanced:
+            logger.error("--total requires --advanced for T2 features")
+            sys.exit(1)
+    elif args.first_half:
+        model_type = "first_half"
+        if not args.advanced:
+            logger.error("--first-half requires --advanced for T2 features")
+            sys.exit(1)
+
     logger.info("Starting training pipeline")
     logger.info("  Seasons:  %s", args.seasons)
+    logger.info("  Model:    %s", model_type)
     logger.info("  Tier:     %s", "T2 (advanced)" if args.advanced else "T1 (baseline)")
     logger.info("  Output:   %s", args.output_path)
 
@@ -99,14 +134,46 @@ def main():
         logger.info("Loaded ratings for %d teams", len(player_ratings))
 
     # ── Step 3: Feature engineering ────────────────────────────────────────────
-    logger.info("Engineering features (use_advanced=%s)...", args.advanced)
-    from nba_bot.features import build_game_state_rows
-    df = build_game_state_rows(
-        df_nbastats    = df_nbastats,
-        df_pbpstats    = df_pbpstats,
-        player_ratings = player_ratings,
-        use_advanced   = args.advanced,
-    )
+    logger.info("Engineering features (use_advanced=%s, model_type=%s)...", args.advanced, model_type)
+    from nba_bot.features import build_game_state_rows, build_spread_rows, build_total_rows, build_first_half_rows
+
+    if model_type == "spread":
+        df = build_spread_rows(
+            df_nbastats    = df_nbastats,
+            df_pbpstats    = df_pbpstats,
+            player_ratings = player_ratings,
+        )
+        from nba_bot.config import FEATURES_SPREAD
+        feature_cols = FEATURES_SPREAD
+        target_col = "covered_spread"
+    elif model_type == "total":
+        df = build_total_rows(
+            df_nbastats    = df_nbastats,
+            df_pbpstats    = df_pbpstats,
+            player_ratings = player_ratings,
+        )
+        from nba_bot.config import FEATURES_TOTAL
+        feature_cols = FEATURES_TOTAL
+        target_col = "went_over"
+    elif model_type == "first_half":
+        df = build_first_half_rows(
+            df_nbastats    = df_nbastats,
+            df_pbpstats    = df_pbpstats,
+            player_ratings = player_ratings,
+        )
+        from nba_bot.config import FEATURES_FIRST_HALF
+        feature_cols = FEATURES_FIRST_HALF
+        target_col = "home_win"
+    else:
+        df = build_game_state_rows(
+            df_nbastats    = df_nbastats,
+            df_pbpstats    = df_pbpstats,
+            player_ratings = player_ratings,
+            use_advanced   = args.advanced,
+        )
+        from nba_bot.config import FEATURES_T1, FEATURES_T2
+        feature_cols = FEATURES_T1 + (FEATURES_T2 if args.advanced else [])
+        target_col = "home_win"
 
     if df.empty:
         logger.error("Feature engineering produced no rows. Check data download.")
@@ -114,21 +181,18 @@ def main():
 
     logger.info("Feature DataFrame: %d rows, %d columns", len(df), len(df.columns))
 
-    from nba_bot.config import FEATURES_T1, FEATURES_T2
-    feature_cols = FEATURES_T1 + (FEATURES_T2 if args.advanced else [])
-
     # Remove tip-off rows (no information at game start)
     df = df[df["time_remaining"] < 2870].copy()
-    df = df.dropna(subset=feature_cols + ["home_win"])
+    df = df.dropna(subset=feature_cols + [target_col])
 
     logger.info("After filtering: %d rows", len(df))
 
     # Class balance check
-    balance = df["home_win"].mean()
-    logger.info("Class balance (home_win=1): %.1f%%", balance * 100)
+    balance = df[target_col].mean()
+    logger.info("Class balance (%s=1): %.1f%%", target_col, balance * 100)
 
     X = df[feature_cols].values
-    y = df["home_win"].values
+    y = df[target_col].values
 
     # ── Step 4: Train models ───────────────────────────────────────────────────
     try:
@@ -207,10 +271,22 @@ def main():
     print(f"{'=' * 50}\n")
 
     # ── Step 5: Save artifacts ─────────────────────────────────────────────────
-    tier        = "2" if args.advanced else "1"
-    model_name  = f"xgb_model_t{tier}.pkl"
-    model_path  = os.path.join(args.output_path, model_name)
-    cols_path   = os.path.join(args.output_path, "feature_cols.pkl")
+    tier = "2" if args.advanced else "1"
+    if model_type == "spread":
+        model_name = f"xgb_spread_t{tier}.pkl"
+        cols_name = "feature_cols_spread.pkl"
+    elif model_type == "total":
+        model_name = f"xgb_total_t{tier}.pkl"
+        cols_name = "feature_cols_total.pkl"
+    elif model_type == "first_half":
+        model_name = f"xgb_first_half_t{tier}.pkl"
+        cols_name = "feature_cols_first_half.pkl"
+    else:
+        model_name = f"xgb_model_t{tier}.pkl"
+        cols_name = "feature_cols.pkl"
+
+    model_path = os.path.join(args.output_path, model_name)
+    cols_path = os.path.join(args.output_path, cols_name)
 
     joblib.dump(xgb_model, model_path)
     joblib.dump(feature_cols, cols_path)
@@ -219,7 +295,19 @@ def main():
 
     print(f"  ✅ Saved: {model_path}")
     print(f"  ✅ Saved: {cols_path}")
-    print(f"\n  Set model path:  export NBA_BOT_MODEL_PATH={model_path}")
+
+    # Print appropriate env var instructions
+    if model_type == "spread":
+        print(f"\n  Set model path:  export NBA_BOT_SPREAD_MODEL_PATH={model_path}")
+        print(f"  Enable trading:  export NBA_BOT_ENABLE_SPREAD_TRADING=true")
+    elif model_type == "total":
+        print(f"\n  Set model path:  export NBA_BOT_TOTAL_MODEL_PATH={model_path}")
+        print(f"  Enable trading:  export NBA_BOT_ENABLE_TOTAL_TRADING=true")
+    elif model_type == "first_half":
+        print(f"\n  Set model path:  export NBA_BOT_FIRST_HALF_MODEL_PATH={model_path}")
+        print(f"  Enable trading:  export NBA_BOT_ENABLE_FIRST_HALF_TRADING=true")
+    else:
+        print(f"\n  Set model path:  export NBA_BOT_MODEL_PATH={model_path}")
     print(f"  Then run:        nba-bot-scan --mode test\n")
 
 

@@ -20,9 +20,11 @@ Flags:
 import argparse
 import logging
 import random
+import re
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 from nba_bot import config
 from nba_bot.model import load_model, predict_home_win_prob
@@ -34,6 +36,40 @@ from nba_bot.polymarket import (
     print_alert,
     print_no_edge,
 )
+
+
+def _load_auxiliary_models():
+    """
+    Loads spread, total, and first_half models if configured.
+    
+    Returns dict with model and feature_cols for each market type.
+    """
+    from nba_bot.model import load_model
+    
+    models = {}
+    
+    # Load spread model
+    if config.SPREAD_MODEL_PATH and config.ENABLE_SPREAD_TRADING:
+        spread_model, spread_cols = load_model(config.SPREAD_MODEL_PATH)
+        if spread_model:
+            models["spread"] = {"model": spread_model, "feature_cols": spread_cols}
+            logger.info("Spread model loaded from %s", config.SPREAD_MODEL_PATH)
+    
+    # Load total model
+    if config.TOTAL_MODEL_PATH and config.ENABLE_TOTAL_TRADING:
+        total_model, total_cols = load_model(config.TOTAL_MODEL_PATH)
+        if total_model:
+            models["total"] = {"model": total_model, "feature_cols": total_cols}
+            logger.info("Total model loaded from %s", config.TOTAL_MODEL_PATH)
+    
+    # Load first half model
+    if config.FIRST_HALF_MODEL_PATH and config.ENABLE_FIRST_HALF_TRADING:
+        fh_model, fh_cols = load_model(config.FIRST_HALF_MODEL_PATH)
+        if fh_model:
+            models["first_half"] = {"model": fh_model, "feature_cols": fh_cols}
+            logger.info("First half model loaded from %s", config.FIRST_HALF_MODEL_PATH)
+    
+    return models
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +121,70 @@ def _get_live_advanced_ctx(game_id: str, team_stats: dict) -> dict:
         "player_quality_home": 0.0,   # will be overwritten by caller from team_stats
         "player_quality_away": 0.0,
     }
+
+
+def _infer_uses_t2(model, feature_cols) -> bool:
+    if model is None:
+        return False
+    try:
+        return model.n_features_in_ == len(config.FEATURES_ALL)
+    except AttributeError:
+        return feature_cols is not None and len(feature_cols) == len(config.FEATURES_ALL)
+
+
+def _build_model_entry(model, feature_cols, model_path: str | None, fallback_key: str) -> dict:
+    label = Path(model_path).stem if model_path else fallback_key
+    key = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or fallback_key
+    return {
+        "key": key,
+        "label": label,
+        "path": model_path,
+        "model": model,
+        "feature_cols": feature_cols,
+        "use_t2": _infer_uses_t2(model, feature_cols),
+    }
+
+
+def _print_model_comparison_summary(alerts: list[dict], model_entries: list[dict]) -> None:
+    if len(model_entries) < 2 or not alerts:
+        return
+
+    grouped_alerts: dict[str, list[dict]] = {}
+    for alert in alerts:
+        market_id = str(alert.get("market_id") or "")
+        grouped_alerts.setdefault(market_id, []).append(alert)
+
+    print("  Model Compare:")
+    for _, group in sorted(
+        grouped_alerts.items(),
+        key=lambda item: max(
+            abs(float(alert.get("calibrated_edge", alert.get("edge", 0.0)) or 0.0))
+            for alert in item[1]
+        ),
+        reverse=True,
+    ):
+        market = group[0].get("market", "")
+        if len(group) == 1:
+            alert = group[0]
+            print(
+                f"    - {alert.get('model_label', 'model')} only | {alert.get('direction')} | "
+                f"edge={float(alert.get('calibrated_edge', alert.get('edge', 0.0)) or 0.0):.4f} | "
+                f"{market[:70]}"
+            )
+            continue
+
+        directions = {alert.get("direction") for alert in group}
+        status = "DISAGREE" if len(directions) > 1 else "AGREE"
+        details = "; ".join(
+            (
+                f"{alert.get('model_label', alert.get('model_key', 'model'))}: "
+                f"{alert.get('direction')} edge={float(alert.get('calibrated_edge', alert.get('edge', 0.0)) or 0.0):.4f} "
+                f"stake={float(alert.get('raw_stake', 0.0) or 0.0):.4f}"
+            )
+            for alert in sorted(group, key=lambda item: item.get("model_label") or item.get("model_key") or "")
+        )
+        print(f"    - {status} | {market[:70]}")
+        print(f"      {details}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -175,6 +275,7 @@ def run_live_mode(
     use_paper_hardened: bool = False,
     initial_bankroll: float | None = None,
     random_seed: int | None = None,
+    model_entries: list[dict] | None = None,
 ):
     """
     Continuous polling loop. Fetches live NBA scores and Polymarket prices,
@@ -189,6 +290,12 @@ def run_live_mode(
         random.seed(random_seed)
         logger.info("Random seed set to %d", random_seed)
 
+    active_model_entries = [
+        dict(entry)
+        for entry in (model_entries or [_build_model_entry(model, feature_cols, config.MODEL_PATH, "primary")])
+        if entry.get("model") is not None
+    ]
+
     print()
     print("=" * 60)
     print(f"  NBA × POLYMARKET  —  {'WebSocket' if use_ws else 'REST'} Edge Scanner")
@@ -198,13 +305,15 @@ def run_live_mode(
     print(f"  Kelly fraction     : {config.KELLY_FRACTION * 100:.0f}%  (quarter Kelly)")
     print(f"  Scan interval      : {interval}s")
     print(f"  Price source       : {'WS real-time' if use_ws else 'CLOB REST mid-point'}")
-    if model is None:
+    if active_model_entries:
+        print("  Models loaded      : " + ", ".join(entry["label"] for entry in active_model_entries))
+    else:
         print("  [!] Model not loaded — edge computation disabled")
 
     # Initialise paper trading if requested
     if use_paper_hardened:
         from nba_bot.market_analytics import check_data_api_available
-        from nba_bot.paper import _load_bankroll, init_bankroll
+        from nba_bot.paper import _load_bankroll, init_bankroll, load_model_bankrolls
 
         if not check_data_api_available():
             print("  [!] Data API unavailable — hardened paper trading requires a live Data API connection.")
@@ -213,29 +322,42 @@ def run_live_mode(
         init_bankroll(
             initial_amount=initial_bankroll or config.DEFAULT_BANKROLL,
             reset_if_exists=bool(initial_bankroll),
+            model_keys=[entry["key"] for entry in active_model_entries],
         )
-        current_bankroll = _load_bankroll()
-        print(f"  Paper Trading      : HARDENED  (bankroll: ${current_bankroll:.2f})")
+        model_bankrolls = load_model_bankrolls()
+        if len(active_model_entries) > 1:
+            bankroll_summary = ", ".join(
+                f"{entry['label']}: ${model_bankrolls.get(entry['key'], _load_bankroll(model_key=entry['key'])):.2f}"
+                for entry in active_model_entries
+            )
+            print(f"  Paper Trading      : HARDENED  ({bankroll_summary})")
+        else:
+            current_bankroll = _load_bankroll(model_key=active_model_entries[0]["key"] if active_model_entries else None)
+            print(f"  Paper Trading      : HARDENED  (bankroll: ${current_bankroll:.2f})")
     elif use_paper:
         from nba_bot.paper import init_bankroll, _load_bankroll
         init_bankroll(
             initial_amount=initial_bankroll or config.DEFAULT_BANKROLL,
             reset_if_exists=bool(initial_bankroll),
+            model_keys=[entry["key"] for entry in active_model_entries],
         )
-        current_bankroll = _load_bankroll()
-        print(f"  Paper Trading      : ACTIVE  (bankroll: ${current_bankroll:.2f})")
+        if len(active_model_entries) > 1:
+            bankroll_summary = ", ".join(
+                f"{entry['label']}: ${_load_bankroll(model_key=entry['key']):.2f}"
+                for entry in active_model_entries
+            )
+            print(f"  Paper Trading      : ACTIVE  ({bankroll_summary})")
+        else:
+            current_bankroll = _load_bankroll(model_key=active_model_entries[0]["key"] if active_model_entries else None)
+            print(f"  Paper Trading      : ACTIVE  (bankroll: ${current_bankroll:.2f})")
 
     from nba_bot.team_stats_cache import load_team_stats
     team_stats = load_team_stats()
 
-    # Determine model tier
-    use_t2 = False
-    if model is not None:
-        try:
-            use_t2 = model.n_features_in_ == len(config.FEATURES_ALL)
-        except AttributeError:
-            if feature_cols is not None:
-                use_t2 = len(feature_cols) == len(config.FEATURES_ALL)
+    # Load auxiliary models (spread, total, first_half)
+    auxiliary_models = _load_auxiliary_models()
+
+    use_t2 = any(entry["use_t2"] for entry in active_model_entries)
 
     # Start WebSocket listener if requested
     ws_price_cache = None
@@ -283,10 +405,12 @@ def run_live_mode(
 
             else:
                 all_alerts = []
-                current_bankroll = 0.0
-                if use_paper_hardened:
+                all_rejections: dict[str, int] = {}
+                bankroll_by_model: dict[str, float] = {}
+                if use_paper_hardened or use_paper:
                     from nba_bot.paper import _load_bankroll
-                    current_bankroll = _load_bankroll()
+                    for model_entry in active_model_entries:
+                        bankroll_by_model[model_entry["key"]] = _load_bankroll(model_key=model_entry["key"])
 
                 for game in live_games:
                     # Build Tier-2 context if model needs it
@@ -303,20 +427,39 @@ def run_live_mode(
                         )
                         advanced_ctx = ctx
 
-                    alerts = compute_edge(
-                        model         = model,
-                        game          = game,
-                        markets       = markets,
-                        feature_cols  = feature_cols,
-                        advanced_ctx  = advanced_ctx,
-                        price_cache   = ws_price_cache,
-                        hardened      = use_paper_hardened,
-                        bankroll      = current_bankroll,
-                    )
-                    all_alerts.extend(alerts)
+                    for model_entry in active_model_entries:
+                        result = compute_edge(
+                            model         = model_entry["model"],
+                            game          = game,
+                            markets       = markets,
+                            feature_cols  = model_entry["feature_cols"],
+                            advanced_ctx  = advanced_ctx if model_entry["use_t2"] else None,
+                            price_cache   = ws_price_cache,
+                            hardened      = use_paper_hardened,
+                            bankroll      = bankroll_by_model.get(model_entry["key"], 0.0),
+                            model_key     = model_entry["key"],
+                            model_label   = model_entry["label"],
+                            return_rejections = use_paper_hardened,
+                            spread_model  = auxiliary_models.get("spread", {}).get("model"),
+                            spread_feature_cols = auxiliary_models.get("spread", {}).get("feature_cols"),
+                            total_model   = auxiliary_models.get("total", {}).get("model"),
+                            total_feature_cols = auxiliary_models.get("total", {}).get("feature_cols"),
+                            first_half_model = auxiliary_models.get("first_half", {}).get("model"),
+                            first_half_feature_cols = auxiliary_models.get("first_half", {}).get("feature_cols"),
+                        )
+                        if use_paper_hardened:
+                            alerts, rejections = result
+                            for key, count in rejections.items():
+                                all_rejections[key] = all_rejections.get(key, 0) + count
+                        else:
+                            alerts = result
+                        all_alerts.extend(alerts)
 
                 if all_alerts:
-                    all_alerts.sort(key=lambda x: abs(x["edge"]), reverse=True)
+                    if len(active_model_entries) > 1:
+                        _print_model_comparison_summary(all_alerts, active_model_entries)
+                    sort_key = "calibrated_edge" if use_paper_hardened else "edge"
+                    all_alerts.sort(key=lambda x: abs(float(x.get(sort_key, x.get("edge", 0.0)) or 0.0)), reverse=True)
                     print(f"\n  >>> {len(all_alerts)} ALERT(S) THIS SCAN <<<")
                     for alert in all_alerts:
                         print_alert(alert)
@@ -335,7 +478,8 @@ def run_live_mode(
                             from nba_bot.paper import execute_paper_trade
                             execute_paper_trade(alert)
                 else:
-                    print_no_edge(len(live_games), len(markets))
+                    rejections_arg = all_rejections if use_paper_hardened else None
+                    print_no_edge(len(live_games), len(markets), rejections=rejections_arg)
 
             print(f"  Sleeping {interval}s...  (Ctrl+C to stop)\n")
             time.sleep(interval)
@@ -378,6 +522,12 @@ def main():
         default=None,
         metavar="PATH",
         help=f"Model .pkl path (default: {config.MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--compare-model-path",
+        default=config.COMPARE_MODEL_PATH,
+        metavar="PATH",
+        help="Optional secondary .pkl path for side-by-side live comparison",
     )
     parser.add_argument(
         "--interval",
@@ -428,6 +578,20 @@ def main():
     # Load model (non-fatal if not found)
     model_path   = args.model_path or config.MODEL_PATH
     model, fcols = load_model(model_path)
+    model_entries = []
+    if model is not None:
+        model_entries.append(_build_model_entry(model, fcols, model_path, "primary"))
+
+    if args.compare_model_path:
+        compare_model, compare_fcols = load_model(args.compare_model_path)
+        if compare_model is None:
+            print(f"  [!] Compare model not loaded — ignoring {args.compare_model_path}")
+        else:
+            compare_entry = _build_model_entry(compare_model, compare_fcols, args.compare_model_path, "compare")
+            if any(existing["key"] == compare_entry["key"] for existing in model_entries):
+                compare_entry["key"] = f"{compare_entry['key']}_compare"
+                compare_entry["label"] = f"{compare_entry['label']} (compare)"
+            model_entries.append(compare_entry)
 
     if args.mode == "test":
         run_test_mode(model, fcols)
@@ -445,6 +609,7 @@ def main():
             use_paper_hardened = args.paper_hardened,
             initial_bankroll = args.bankroll,
             random_seed      = args.seed,
+            model_entries    = model_entries,
         )
 
 if __name__ == "__main__":

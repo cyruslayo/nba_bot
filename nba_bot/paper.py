@@ -49,6 +49,47 @@ PENDING_TRADE_MAX_AGE_HOURS = 6
 HARDENED_EXECUTION_STATS: dict[str, int] = {}
 
 
+def _normalize_model_key(model_key: str | None) -> str | None:
+    if model_key is None:
+        return None
+    normalized = str(model_key).strip()
+    return normalized or None
+
+
+def _trade_model_key(trade: dict) -> str | None:
+    return _normalize_model_key(trade.get("model_key"))
+
+
+def _load_bankroll_payload() -> dict:
+    if not os.path.exists(PAPER_BANKROLL_PATH):
+        return {}
+    with open(PAPER_BANKROLL_PATH, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    return payload if isinstance(payload, dict) else {}
+
+
+def load_model_bankrolls() -> dict[str, float]:
+    payload = _load_bankroll_payload()
+    raw_bankrolls = payload.get("bankrolls")
+    if not isinstance(raw_bankrolls, dict):
+        return {}
+
+    bankrolls: dict[str, float] = {}
+    for key, value in raw_bankrolls.items():
+        normalized_key = _normalize_model_key(str(key))
+        if normalized_key is None:
+            continue
+        try:
+            bankrolls[normalized_key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return bankrolls
+
+
+def _total_model_bankroll(bankrolls: dict[str, float]) -> float:
+    return round(sum(float(amount) for amount in bankrolls.values()), 2)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Atomic JSON helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,7 +106,7 @@ def _atomic_write(path: str, data) -> None:
 # Bankroll management
 # ─────────────────────────────────────────────────────────────────────────────
 
-def init_bankroll(initial_amount: float, reset_if_exists: bool = False) -> None:
+def init_bankroll(initial_amount: float, reset_if_exists: bool = False, model_keys: list[str] | None = None) -> None:
     """
     Initialise the bankroll JSON file.
 
@@ -74,24 +115,87 @@ def init_bankroll(initial_amount: float, reset_if_exists: bool = False) -> None:
     If the file already exists and *reset_if_exists* is False, this is a no-op
     so that successive runs without --bankroll preserve accumulated P&L.
     """
+    normalized_model_keys = []
+    for model_key in model_keys or []:
+        normalized_key = _normalize_model_key(model_key)
+        if normalized_key is not None and normalized_key not in normalized_model_keys:
+            normalized_model_keys.append(normalized_key)
+
     if os.path.exists(PAPER_BANKROLL_PATH) and not reset_if_exists:
-        logger.debug("Bankroll file exists; skipping init (reset_if_exists=False).")
+        if not normalized_model_keys:
+            logger.debug("Bankroll file exists; skipping init (reset_if_exists=False).")
+            return
+
+        payload = _load_bankroll_payload()
+        bankrolls = load_model_bankrolls()
+        updated = False
+        try:
+            seed_amount = float(payload.get("bankroll", initial_amount))
+        except (TypeError, ValueError):
+            seed_amount = float(initial_amount)
+
+        for model_key in normalized_model_keys:
+            if model_key not in bankrolls:
+                bankrolls[model_key] = round(seed_amount, 2)
+                updated = True
+
+        if updated:
+            payload["bankrolls"] = bankrolls
+            payload["bankroll"] = _total_model_bankroll(bankrolls)
+            _atomic_write(PAPER_BANKROLL_PATH, payload)
+            logger.info("Model bankrolls initialised at $%.2f → %s", seed_amount, PAPER_BANKROLL_PATH)
+        else:
+            logger.debug("Requested model bankrolls already exist; skipping init.")
         return
-    _atomic_write(PAPER_BANKROLL_PATH, {"bankroll": initial_amount})
+
+    payload = {"bankroll": round(initial_amount, 2)}
+    if normalized_model_keys:
+        bankrolls = {
+            model_key: round(initial_amount, 2)
+            for model_key in normalized_model_keys
+        }
+        payload["bankrolls"] = bankrolls
+        payload["bankroll"] = _total_model_bankroll(bankrolls)
+    _atomic_write(PAPER_BANKROLL_PATH, payload)
     logger.info("Bankroll initialised at $%.2f → %s", initial_amount, PAPER_BANKROLL_PATH)
 
 
-def _load_bankroll() -> float:
+def _load_bankroll(model_key: str | None = None) -> float:
     """Read current bankroll from JSON. Returns DEFAULT_BANKROLL if file missing."""
-    if not os.path.exists(PAPER_BANKROLL_PATH):
-        return DEFAULT_BANKROLL
-    with open(PAPER_BANKROLL_PATH, encoding="utf-8") as fh:
-        return float(json.load(fh).get("bankroll", DEFAULT_BANKROLL))
+    normalized_model_key = _normalize_model_key(model_key)
+    bankrolls = load_model_bankrolls()
+    if normalized_model_key is not None:
+        if normalized_model_key in bankrolls:
+            return bankrolls[normalized_model_key]
+        if bankrolls:
+            return DEFAULT_BANKROLL
+
+    payload = _load_bankroll_payload()
+    if payload:
+        try:
+            if "bankroll" in payload:
+                return float(payload.get("bankroll", DEFAULT_BANKROLL))
+        except (TypeError, ValueError):
+            pass
+
+    if normalized_model_key is None and bankrolls:
+        return _total_model_bankroll(bankrolls)
+
+    return DEFAULT_BANKROLL
 
 
-def _save_bankroll(amount: float) -> None:
+def _save_bankroll(amount: float, model_key: str | None = None) -> None:
     """Atomically persist updated bankroll."""
-    _atomic_write(PAPER_BANKROLL_PATH, {"bankroll": amount})
+    payload = _load_bankroll_payload()
+    normalized_model_key = _normalize_model_key(model_key)
+    if normalized_model_key is None:
+        payload["bankroll"] = round(amount, 2)
+    else:
+        bankrolls = load_model_bankrolls()
+        bankrolls[normalized_model_key] = round(amount, 2)
+        payload["bankrolls"] = bankrolls
+        payload["bankroll"] = _total_model_bankroll(bankrolls)
+    _atomic_write(PAPER_BANKROLL_PATH, payload)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,14 +219,18 @@ def save_trades(trades: list[dict]) -> None:
 # Idempotency guard
 # ─────────────────────────────────────────────────────────────────────────────
 
-def has_active_position(market_id: str) -> bool:
+def has_active_position(market_id: str, model_key: str | None = None) -> bool:
     """
     Returns True if there is already a PENDING paper trade for *market_id*.
     Used to prevent duplicate entries across scanner loops.
     """
+    normalized_model_key = _normalize_model_key(model_key)
     for trade in load_trades():
-        if trade.get("market_id") == market_id and trade.get("status") == "PENDING":
-            return True
+        if trade.get("market_id") != market_id or trade.get("status") != "PENDING":
+            continue
+        if normalized_model_key is not None and _trade_model_key(trade) != normalized_model_key:
+            continue
+        return True
     return False
 
 
@@ -191,12 +299,15 @@ def _bucket_exposure_pct(bucket: str) -> float:
     return MAX_OTHER_EXPOSURE_PCT
 
 
-def get_game_exposure(event_slug: str, bucket: str | None = None) -> float:
+def get_game_exposure(event_slug: str, bucket: str | None = None, model_key: str | None = None) -> float:
     total = 0.0
     cutoff_time = _pending_cutoff_time()
+    normalized_model_key = _normalize_model_key(model_key)
 
     for trade in load_trades():
         if trade.get("event_slug") != event_slug:
+            continue
+        if normalized_model_key is not None and _trade_model_key(trade) != normalized_model_key:
             continue
         if bucket is not None:
             trade_bucket = trade.get("bucket") or classify_market_bucket(trade.get("market", ""))
@@ -210,7 +321,7 @@ def get_game_exposure(event_slug: str, bucket: str | None = None) -> float:
     return total
 
 
-def find_clustered_trade(event_slug: str, market: str, bucket: str, market_id: str, cluster_distance: float) -> dict | None:
+def find_clustered_trade(event_slug: str, market: str, bucket: str, market_id: str, cluster_distance: float, model_key: str | None = None) -> dict | None:
     if bucket not in {"spread", "total"} or cluster_distance <= 0:
         return None
 
@@ -220,10 +331,13 @@ def find_clustered_trade(event_slug: str, market: str, bucket: str, market_id: s
 
     family_key = _market_family_key(market)
     cutoff_time = _pending_cutoff_time()
+    normalized_model_key = _normalize_model_key(model_key)
     for trade in load_trades():
         if str(trade.get("market_id")) == str(market_id):
             continue
         if trade.get("event_slug") != event_slug:
+            continue
+        if normalized_model_key is not None and _trade_model_key(trade) != normalized_model_key:
             continue
         if not _is_recent_pending_trade(trade, cutoff_time=cutoff_time):
             continue
@@ -253,6 +367,8 @@ def _record_hardened_decision(reason: str, alert: dict, level: str = "info", **f
 
     payload = {
         "count": HARDENED_EXECUTION_STATS[reason],
+        "model_key": alert.get("model_key"),
+        "model_label": alert.get("model_label"),
         "market_id": alert.get("market_id"),
         "event_slug": alert.get("event_slug", ""),
         "market": alert.get("market", ""),
@@ -406,14 +522,16 @@ def execute_paper_trade(alert: dict) -> None:
     market = alert.get("market", "")
     bucket = alert.get("bucket") or classify_market_bucket(market)
     line_value = _extract_line_value(market)
+    model_key = _normalize_model_key(alert.get("model_key"))
+    model_label = alert.get("model_label")
 
     # 1. Idempotency check
-    if has_active_position(market_id):
+    if has_active_position(market_id, model_key=model_key):
         logger.debug("Skipping paper trade — active position already open for market %s", market_id)
         return
 
     # 2. Bankroll guard
-    bankroll = _load_bankroll()
+    bankroll = _load_bankroll(model_key=model_key)
     if bankroll <= 0:
         logger.warning("Bankroll is $%.2f — skipping paper trade.", bankroll)
         return
@@ -434,6 +552,8 @@ def execute_paper_trade(alert: dict) -> None:
         "direction": direction,
         "bucket": bucket,
         "line_value": line_value,
+        "model_key": model_key,
+        "model_label": model_label,
         "enter_price": enter_price,
         "stake": stake,
         "edge": round(edge, 4),
@@ -443,7 +563,7 @@ def execute_paper_trade(alert: dict) -> None:
 
     # 5. Deduct from bankroll (only after trade write succeeds)
     new_bankroll = round(bankroll - stake, 2)
-    _save_bankroll(new_bankroll)
+    _save_bankroll(new_bankroll, model_key=model_key)
 
     # 6. Console confirmation
     print(
@@ -468,6 +588,8 @@ def execute_paper_trade_hardened(alert: dict, data_api_checked: bool = True) -> 
     raw_stake = float(alert.get("raw_stake", 0.0) or 0.0)
     edge = float(alert.get("calibrated_edge", alert.get("edge", 0.0)) or 0.0)
     liquidity = float(alert.get("liquidity", 0.0) or 0.0)
+    model_key = _normalize_model_key(alert.get("model_key"))
+    model_label = alert.get("model_label")
     asset_id = alert.get("trade_token")
     if not asset_id:
         if "NO" in direction.upper():
@@ -482,11 +604,11 @@ def execute_paper_trade_hardened(alert: dict, data_api_checked: bool = True) -> 
             _record_hardened_decision("data_api_unavailable", alert, level="warning")
             return False
 
-    if has_active_position(market_id):
+    if has_active_position(market_id, model_key=model_key):
         _record_hardened_decision("active_position", alert, level="debug")
         return False
 
-    bankroll = _load_bankroll()
+    bankroll = _load_bankroll(model_key=model_key)
     if bankroll <= 0:
         _record_hardened_decision("bankroll_nonpositive", alert, level="warning", bankroll=f"{bankroll:.2f}")
         return False
@@ -499,7 +621,7 @@ def execute_paper_trade_hardened(alert: dict, data_api_checked: bool = True) -> 
         return False
 
     max_game_exposure = bankroll * MAX_GAME_EXPOSURE_PCT
-    current_game_exposure = get_game_exposure(event_slug)
+    current_game_exposure = get_game_exposure(event_slug, model_key=model_key)
     if event_slug and current_game_exposure + stake > max_game_exposure:
         _record_hardened_decision(
             "event_exposure_cap",
@@ -512,7 +634,7 @@ def execute_paper_trade_hardened(alert: dict, data_api_checked: bool = True) -> 
 
     bucket_cap_pct = _bucket_exposure_pct(bucket)
     bucket_cap = bankroll * bucket_cap_pct
-    current_bucket_exposure = get_game_exposure(event_slug, bucket=bucket)
+    current_bucket_exposure = get_game_exposure(event_slug, bucket=bucket, model_key=model_key)
     if event_slug and bucket_cap_pct > 0 and current_bucket_exposure + stake > bucket_cap:
         _record_hardened_decision(
             "bucket_exposure_cap",
@@ -525,7 +647,7 @@ def execute_paper_trade_hardened(alert: dict, data_api_checked: bool = True) -> 
         return False
 
     cluster_distance = SPREAD_CLUSTER_DISTANCE if bucket == "spread" else TOTAL_CLUSTER_DISTANCE if bucket == "total" else 0.0
-    clustered_trade = find_clustered_trade(event_slug, market, bucket, market_id, cluster_distance)
+    clustered_trade = find_clustered_trade(event_slug, market, bucket, market_id, cluster_distance, model_key=model_key)
     if clustered_trade is not None:
         _record_hardened_decision(
             "line_cluster_block",
@@ -564,6 +686,8 @@ def execute_paper_trade_hardened(alert: dict, data_api_checked: bool = True) -> 
         "direction":      direction,
         "bucket":         bucket,
         "line_value":     line_value,
+        "model_key":      model_key,
+        "model_label":    model_label,
         "trade_token":    asset_id,
         "enter_price":    enter_price,
         "adjusted_price": round(adjusted_price, 4),
@@ -581,7 +705,7 @@ def execute_paper_trade_hardened(alert: dict, data_api_checked: bool = True) -> 
     save_trades(trades)
 
     new_bankroll = round(bankroll - stake, 2)
-    _save_bankroll(new_bankroll)
+    _save_bankroll(new_bankroll, model_key=model_key)
 
     print(
         f"\n  HARDENED PAPER TRADE: {direction} | "

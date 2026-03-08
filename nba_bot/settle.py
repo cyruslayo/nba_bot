@@ -19,7 +19,7 @@ from collections import defaultdict
 import requests
 
 from nba_bot.config import GAMMA_API, HEADERS, PAPER_BANKROLL_PATH, PAPER_TRADES_PATH, PLATFORM_FEE_RATE
-from nba_bot.paper import _load_bankroll, _save_bankroll, classify_market_bucket, load_trades, save_trades
+from nba_bot.paper import _load_bankroll, _save_bankroll, classify_market_bucket, load_model_bankrolls, load_trades, save_trades
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 def _run_status() -> None:
     """Print current bankroll and all PENDING trades, then exit."""
     bankroll = _load_bankroll()
+    model_bankrolls = load_model_bankrolls()
     trades   = load_trades()
     pending  = [t for t in trades if t.get("status") == "PENDING"]
     event_bucket_exposure: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
@@ -45,6 +46,11 @@ def _run_status() -> None:
     print("  NBA BOT PAPER TRADING — STATUS")
     print("=" * 60)
     print(f"  Current bankroll : ${bankroll:,.2f}")
+    if model_bankrolls:
+        print("  Model bankrolls  : " + ", ".join(
+            f"{model_key}=${amount:,.2f}"
+            for model_key, amount in sorted(model_bankrolls.items())
+        ))
     print(f"  Pending trades   : {len(pending)}")
 
     if pending:
@@ -61,6 +67,8 @@ def _run_status() -> None:
         print()
         for i, t in enumerate(pending, 1):
             print(f"  [{i}] {t.get('market', t.get('market_id', '?'))}")
+            if t.get("model_key") or t.get("model_label"):
+                print(f"       Model       : {t.get('model_label') or t.get('model_key')}")
             print(f"       Direction   : {t.get('direction')}")
             print(f"       Bucket      : {t.get('bucket') or classify_market_bucket(t.get('market', ''))}")
             print(f"       Enter price : {t.get('enter_price')}")
@@ -227,6 +235,7 @@ def _run_settle(dry_run: bool, hardened: bool = False) -> None:
     skipped_count = 0
     total_profit  = 0.0
     bankroll_delta = 0.0
+    bankroll_delta_by_model: dict[str, float] = defaultdict(float)
 
     for slug, group in slug_groups.items():
         if not slug:
@@ -258,12 +267,13 @@ def _run_settle(dry_run: bool, hardened: bool = False) -> None:
             won_str  = "WON " if updated["status"] == "WON" else "LOST"
             profit   = updated["profit"]
             total_profit   += profit
-            bankroll_delta += updated["payout"]
 
             print(
                 f"  {'✅' if updated['status'] == 'WON' else '❌'} {won_str} "
                 f"| {trade.get('market', market_id)[:50]}"
             )
+            if trade.get("model_key") or trade.get("model_label"):
+                print(f"       Model      : {trade.get('model_label') or trade.get('model_key')}")
             print(
                 f"       Direction  : {trade.get('direction')}  |  "
                 f"Stake: ${trade.get('stake', 0):,.2f}  |  "
@@ -271,6 +281,12 @@ def _run_settle(dry_run: bool, hardened: bool = False) -> None:
                 f"P&L: ${profit:+,.2f}"
             )
             print()
+
+            model_key = trade.get("model_key")
+            if model_key:
+                bankroll_delta_by_model[str(model_key)] += updated["payout"]
+            else:
+                bankroll_delta += updated["payout"]
 
             if not dry_run:
                 trades[idx] = updated
@@ -283,14 +299,29 @@ def _run_settle(dry_run: bool, hardened: bool = False) -> None:
 
     if not dry_run and settled_count > 0:
         save_trades(trades)
-        new_bankroll = round(_load_bankroll() + bankroll_delta, 2)
-        _save_bankroll(new_bankroll)
+        if bankroll_delta_by_model:
+            for model_key, payout_delta in bankroll_delta_by_model.items():
+                _save_bankroll(round(_load_bankroll(model_key=model_key) + payout_delta, 2), model_key=model_key)
+        if bankroll_delta:
+            _save_bankroll(round(_load_bankroll() + bankroll_delta, 2))
+        new_bankroll = _load_bankroll()
         print(f"  New bankroll       : ${new_bankroll:,.2f}")
+        if bankroll_delta_by_model:
+            print("  Model bankrolls    : " + ", ".join(
+                f"{model_key}=${_load_bankroll(model_key=model_key):,.2f}"
+                for model_key in sorted(bankroll_delta_by_model.keys())
+            ))
         print()
         print("  Files updated: paper_trades.json, paper_bankroll.json")
     elif dry_run:
         print()
-        print(f"  Projected bankroll : ${_load_bankroll() + bankroll_delta:,.2f}  (not written)")
+        projected_total = _load_bankroll() + bankroll_delta + sum(bankroll_delta_by_model.values())
+        print(f"  Projected bankroll : ${projected_total:,.2f}  (not written)")
+        if bankroll_delta_by_model:
+            print("  Projected model bankrolls: " + ", ".join(
+                f"{model_key}=${_load_bankroll(model_key=model_key) + payout_delta:,.2f}"
+                for model_key, payout_delta in sorted(bankroll_delta_by_model.items())
+            ))
     print()
 
 

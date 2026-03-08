@@ -48,7 +48,7 @@ GAME_TAG_ID   = 100639
 MIN_EDGE       = 0.05   # Alert when |model_prob - poly_price| >= 5%
 MIN_LIQUIDITY  = 500    # Skip markets with < $500 total liquidity
 KELLY_FRACTION = 0.25   # 25% of full Kelly (quarter Kelly — conservative)
-EDGE_DECAY_FACTOR = _env_float("NBA_BOT_EDGE_DECAY_FACTOR", "0.7", minimum=0.0, maximum=1.0)
+EDGE_DECAY_FACTOR = _env_float("NBA_BOT_EDGE_DECAY_FACTOR", "1.0", minimum=0.0, maximum=1.0)
 EDGE_CONFIDENCE_THRESHOLD = _env_float("NBA_BOT_EDGE_CONFIDENCE_THRESHOLD", "0.15", minimum=0.0, maximum=1.0)
 SLIPPAGE_BASE = _env_float("NBA_BOT_SLIPPAGE_BASE", "0.005", minimum=0.0, maximum=0.25)
 SLIPPAGE_IMPACT_FACTOR = _env_float("NBA_BOT_SLIPPAGE_IMPACT_FACTOR", "0.1", minimum=0.0, maximum=5.0)
@@ -93,6 +93,20 @@ TIGHT_SPREAD_THRESHOLD = 0.05
 
 # Override by setting NBA_BOT_MODEL_PATH environment variable
 MODEL_PATH = os.environ.get("NBA_BOT_MODEL_PATH", "./xgb_model_t2.pkl")
+COMPARE_MODEL_PATH = os.environ.get("NBA_BOT_COMPARE_MODEL_PATH")
+
+# Spread/Total/First Half model paths
+SPREAD_MODEL_PATH = os.environ.get("NBA_BOT_SPREAD_MODEL_PATH", "")
+TOTAL_MODEL_PATH = os.environ.get("NBA_BOT_TOTAL_MODEL_PATH", "")
+FIRST_HALF_MODEL_PATH = os.environ.get("NBA_BOT_FIRST_HALF_MODEL_PATH", "")
+
+# Feature flags for enabling spread/total/first_half trading
+def _env_bool(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+ENABLE_SPREAD_TRADING = _env_bool("NBA_BOT_ENABLE_SPREAD_TRADING", "false")
+ENABLE_TOTAL_TRADING = _env_bool("NBA_BOT_ENABLE_TOTAL_TRADING", "false")
+ENABLE_FIRST_HALF_TRADING = _env_bool("NBA_BOT_ENABLE_FIRST_HALF_TRADING", "false")
 
 # Path for team stats cache JSON (can be overridden via env var)
 TEAM_STATS_PATH = os.environ.get("NBA_BOT_TEAM_STATS_PATH", "./team_stats.json")
@@ -120,6 +134,15 @@ FEATURES_T2 = [
 
 # Combined feature list for Tier 2 models
 FEATURES_ALL = FEATURES_T1 + FEATURES_T2
+
+# Spread model features: T1/T2 + spread_line + current_score_diff
+FEATURES_SPREAD = FEATURES_T1 + FEATURES_T2 + ["spread_line", "current_score_diff"]
+
+# Total model features: T1/T2 + total_line + current_total + pace
+FEATURES_TOTAL = FEATURES_T1 + FEATURES_T2 + ["total_line", "current_total", "pace"]
+
+# First half model uses same features as moneyline (T1+T2)
+FEATURES_FIRST_HALF = FEATURES_ALL
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Paper trading persistence
