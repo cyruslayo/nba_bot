@@ -1,5 +1,5 @@
 # Model artifacts — can be 50-200 MB, never commit
-*.pkl
+
 
 # Team stats cache — refreshed daily at runtime
 team_stats.json
