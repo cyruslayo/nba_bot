@@ -18,6 +18,7 @@ dependencies = [
     "requests>=2.31",
     "websocket-client>=1.6",
     "polars>=1.0",
+    "pyarrow>=16.0",
 ]
 
 [project.optional-dependencies]
