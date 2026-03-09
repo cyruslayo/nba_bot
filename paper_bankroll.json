@@ -1,7 +1,7 @@
 {
-  "bankroll": 1638.39,
+  "bankroll": 1340.79,
   "bankrolls": {
-    "xgb_model_t2": 835.05,
-    "model_lgb_cal_isotonic_t2": 803.34
+    "xgb_model_t2": 678.79,
+    "model_lgb_cal_isotonic_t2": 662.0
   }
 }

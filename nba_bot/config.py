@@ -29,6 +29,9 @@ def _env_int(name: str, default: str, minimum: int | None = None, maximum: int |
         value = min(value, maximum)
     return value
 
+def _env_bool(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Polymarket API
 # ─────────────────────────────────────────────────────────────────────────────
@@ -66,13 +69,20 @@ HARDENED_MIN_LIQUIDITY = _env_int("NBA_BOT_HARDENED_MIN_LIQUIDITY", "2000", mini
 MAX_STAKE_LIQUIDITY_PCT = _env_float("NBA_BOT_MAX_STAKE_LIQUIDITY_PCT", "0.05", minimum=0.0, maximum=1.0)
 PRICE_STALE_THRESHOLD_SEC = _env_int("NBA_BOT_PRICE_STALE_THRESHOLD_SEC", "30", minimum=1, maximum=600)
 MAX_MONEYLINE_EXPOSURE_PCT = _env_float("NBA_BOT_MAX_MONEYLINE_EXPOSURE_PCT", "0.08", minimum=0.0, maximum=1.0)
-MAX_SPREAD_EXPOSURE_PCT = _env_float("NBA_BOT_MAX_SPREAD_EXPOSURE_PCT", "0.07", minimum=0.0, maximum=1.0)
-MAX_TOTAL_EXPOSURE_PCT = _env_float("NBA_BOT_MAX_TOTAL_EXPOSURE_PCT", "0.07", minimum=0.0, maximum=1.0)
-MAX_FIRST_HALF_EXPOSURE_PCT = _env_float("NBA_BOT_MAX_FIRST_HALF_EXPOSURE_PCT", "0.08", minimum=0.0, maximum=1.0)
+MAX_SPREAD_EXPOSURE_PCT = _env_float("NBA_BOT_MAX_SPREAD_EXPOSURE_PCT", "0.07", minimum=0.0, maximum=1.0)  # 7%
+MAX_TOTAL_EXPOSURE_PCT = _env_float("NBA_BOT_MAX_TOTAL_EXPOSURE_PCT", "0.10", minimum=0.0, maximum=1.0)  # 10%
+MAX_FIRST_HALF_EXPOSURE_PCT = _env_float("NBA_BOT_MAX_FIRST_HALF_EXPOSURE_PCT", "0.06", minimum=0.0, maximum=1.0)  # 6%
 MAX_OTHER_EXPOSURE_PCT = _env_float("NBA_BOT_MAX_OTHER_EXPOSURE_PCT", "0.05", minimum=0.0, maximum=1.0)
 SPREAD_CLUSTER_DISTANCE = _env_float("NBA_BOT_SPREAD_CLUSTER_DISTANCE", "2.0", minimum=0.0, maximum=20.0)
 TOTAL_CLUSTER_DISTANCE = _env_float("NBA_BOT_TOTAL_CLUSTER_DISTANCE", "2.0", minimum=0.0, maximum=30.0)
 DISABLE_STOCHASTIC_FILL = os.environ.get("NBA_BOT_DISABLE_STOCHASTIC_FILL", "false").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_PAPER_TRADING_ENABLED = _env_bool("NBA_BOT_LIVE_PAPER_TRADING_ENABLED", "true")
+CONVERGENCE_TARGET_PCT = _env_float("NBA_BOT_CONVERGENCE_TARGET_PCT", "0.8", minimum=0.0, maximum=1.0)
+MIN_EXIT_EDGE = _env_float("NBA_BOT_MIN_EXIT_EDGE", "0.01", minimum=0.0, maximum=0.25)
+PRE_GAME_EXIT_MINUTES = _env_int("NBA_BOT_PRE_GAME_EXIT_MINUTES", "5", minimum=0, maximum=60)
+STOP_LOSS_PCT = _env_float("NBA_BOT_STOP_LOSS_PCT", "0.10", minimum=0.0, maximum=0.75)
+MAX_CONCURRENT_POSITIONS = _env_int("NBA_BOT_MAX_CONCURRENT_POSITIONS", "10", minimum=1, maximum=500)
+PRICE_UPDATE_INTERVAL_SEC = _env_int("NBA_BOT_PRICE_UPDATE_INTERVAL_SEC", "30", minimum=1, maximum=600)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scanner timing
@@ -96,17 +106,14 @@ MODEL_PATH = os.environ.get("NBA_BOT_MODEL_PATH", "./xgb_model_t2.pkl")
 COMPARE_MODEL_PATH = os.environ.get("NBA_BOT_COMPARE_MODEL_PATH")
 
 # Spread/Total/First Half model paths
-SPREAD_MODEL_PATH = os.environ.get("NBA_BOT_SPREAD_MODEL_PATH", "")
-TOTAL_MODEL_PATH = os.environ.get("NBA_BOT_TOTAL_MODEL_PATH", "")
-FIRST_HALF_MODEL_PATH = os.environ.get("NBA_BOT_FIRST_HALF_MODEL_PATH", "")
+SPREAD_MODEL_PATH = os.environ.get("NBA_BOT_SPREAD_MODEL_PATH", "./xgb_spread_t2.pkl")
+TOTAL_MODEL_PATH = os.environ.get("NBA_BOT_TOTAL_MODEL_PATH", "./xgb_total_t2.pkl")
+FIRST_HALF_MODEL_PATH = os.environ.get("NBA_BOT_FIRST_HALF_MODEL_PATH", "./xgb_first_half_t2.pkl")
 
 # Feature flags for enabling spread/total/first_half trading
-def _env_bool(name: str, default: str) -> bool:
-    return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
-
-ENABLE_SPREAD_TRADING = _env_bool("NBA_BOT_ENABLE_SPREAD_TRADING", "false")
-ENABLE_TOTAL_TRADING = _env_bool("NBA_BOT_ENABLE_TOTAL_TRADING", "false")
-ENABLE_FIRST_HALF_TRADING = _env_bool("NBA_BOT_ENABLE_FIRST_HALF_TRADING", "false")
+ENABLE_SPREAD_TRADING = _env_bool("NBA_BOT_ENABLE_SPREAD_TRADING", "true")
+ENABLE_TOTAL_TRADING = _env_bool("NBA_BOT_ENABLE_TOTAL_TRADING", "true")
+ENABLE_FIRST_HALF_TRADING = _env_bool("NBA_BOT_ENABLE_FIRST_HALF_TRADING", "true")
 
 # Path for team stats cache JSON (can be overridden via env var)
 TEAM_STATS_PATH = os.environ.get("NBA_BOT_TEAM_STATS_PATH", "./team_stats.json")

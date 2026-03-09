@@ -33,6 +33,7 @@ from nba_bot.polymarket import (
     compute_edge,
     fetch_nba_markets,
     kelly_stake,
+    match_game_to_markets,
     print_alert,
     print_no_edge,
 )
@@ -406,6 +407,30 @@ def run_live_mode(
             else:
                 all_alerts = []
                 all_rejections: dict[str, int] = {}
+                games_by_event_slug: dict[str, dict] = {}
+                for game in live_games:
+                    for market, _ in match_game_to_markets(game, markets):
+                        event_slug = market.get("event_slug", "")
+                        if event_slug:
+                            games_by_event_slug[event_slug] = game
+
+                if use_paper_hardened:
+                    from nba_bot.paper import monitor_live_positions
+
+                    monitor_summary = monitor_live_positions(
+                        markets,
+                        games_by_event_slug=games_by_event_slug,
+                        price_cache=ws_price_cache,
+                    )
+                    if monitor_summary["checked"] or monitor_summary["closed"]:
+                        print(
+                            "  Live monitor      : "
+                            f"checked={int(monitor_summary['checked'])} | "
+                            f"closed={int(monitor_summary['closed'])} | "
+                            f"missing_price={int(monitor_summary['missing_price'])} | "
+                            f"realized_pnl=${float(monitor_summary['realized_pnl']):+.2f}"
+                        )
+
                 bankroll_by_model: dict[str, float] = {}
                 if use_paper_hardened or use_paper:
                     from nba_bot.paper import _load_bankroll

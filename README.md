@@ -39,10 +39,26 @@ The bot reads standard configuration limits out of `nba_bot/config.py`, which yo
 
 | Variable | Default Value | Description |
 |----------|---------------|-------------|
-| `NBA_BOT_MODEL_PATH` | `./xgb_model_t2.pkl` | Path to your `.pkl` model file |
+| `NBA_BOT_MODEL_PATH` | `./xgb_model_t2.pkl` | Path to moneyline model `.pkl` file |
+| `NBA_BOT_SPREAD_MODEL_PATH` | `./xgb_spread_t2.pkl` | Path to spread cover model |
+| `NBA_BOT_TOTAL_MODEL_PATH` | `./xgb_total_t2.pkl` | Path to over/under model |
+| `NBA_BOT_FIRST_HALF_MODEL_PATH` | `./xgb_first_half_t2.pkl` | Path to first-half moneyline model |
 | `NBA_BOT_TEAM_STATS_PATH` | `./team_stats.json` | Path to Tier 2 team ratings cache |
 | `NBA_BOT_PAPER_TRADES_PATH` | `./paper_trades.json` | Path for pending/settled paper trades |
 | `NBA_BOT_PAPER_BANKROLL_PATH` | `./paper_bankroll.json` | Path for current paper bankroll |
+| `NBA_BOT_LIVE_PAPER_TRADING_ENABLED` | `true` | Master switch for live paper trading (pre-resolution exits) |
+| `NBA_BOT_CONVERGENCE_TARGET_PCT` | `0.8` | Exit when price reaches this fraction of model's expected value |
+| `NBA_BOT_MIN_EXIT_EDGE` | `0.01` | Minimum edge to hold a position; close if below |
+| `NBA_BOT_PRE_GAME_EXIT_MINUTES` | `5` | Force exit N minutes before game end |
+| `NBA_BOT_STOP_LOSS_PCT` | `0.10` | Exit if price moves against position by this fraction |
+| `NBA_BOT_MAX_CONCURRENT_POSITIONS` | `10` | Maximum number of concurrent OPEN positions |
+| `NBA_BOT_PRICE_UPDATE_INTERVAL_SEC` | `30` | Minimum seconds between price checks for OPEN positions |
+| `NBA_BOT_ENABLE_SPREAD_TRADING` | `true` | Enable spread market trading |
+| `NBA_BOT_ENABLE_TOTAL_TRADING` | `true` | Enable over/under market trading |
+| `NBA_BOT_ENABLE_FIRST_HALF_TRADING` | `true` | Enable first-half market trading |
+| `NBA_BOT_MAX_SPREAD_EXPOSURE_PCT` | `0.07` | Max bankroll exposure per spread market (7%) |
+| `NBA_BOT_MAX_TOTAL_EXPOSURE_PCT` | `0.10` | Max bankroll exposure per total market (10%) |
+| `NBA_BOT_MAX_FIRST_HALF_EXPOSURE_PCT` | `0.06` | Max bankroll exposure per first-half market (6%) |
 
 **Example:**
 ```bash
@@ -68,7 +84,43 @@ nba-bot-train --seasons 2022 2023 2024 --output-path ./models/
 nba-bot-train --seasons 2022 2023 2024 --output-path ./models/ --advanced
 ```
 
-### 5. Running the Scanner
+### 5. Specialized Models (Spread / Total / First Half)
+
+In addition to the moneyline model, the scanner supports three specialized market types:
+
+| Model | File | Features | Exposure Limit |
+|-------|------|----------|----------------|
+| **Spread** | `xgb_spread_t2.pkl` | T1 + T2 + spread_line + current_score_diff | 7% |
+| **Total** | `xgb_total_t2.pkl` | T1 + T2 + total_line + current_total + pace | 10% |
+| **First Half** | `xgb_first_half_t2.pkl` | T1 + T2 (same as moneyline) | 6% |
+
+**Setup:**
+
+1. Train each model using the specialized training notebooks or scripts
+2. Save feature column artifacts alongside models:
+   ```
+   xgb_spread_t2.pkl       + feature_cols_xgb_spread_t2.pkl
+   xgb_total_t2.pkl        + feature_cols_xgb_total_t2.pkl
+   xgb_first_half_t2.pkl   + feature_cols_xgb_first_half_t2.pkl
+   ```
+3. Models are auto-loaded when paths are set in `config.py` or via environment variables
+4. Trading flags control which market types are active
+
+**Market Classification:**
+
+The scanner automatically classifies markets by parsing question text:
+- **Spread**: Questions containing "spread" (e.g., "Lakers -5.5")
+- **Total**: Questions containing "o/u", "over/under", or "total" (e.g., "Over 220.5")
+- **First Half**: Questions containing "1h", "1st half", or "first half"
+
+**Disable a market type:**
+```bash
+export NBA_BOT_ENABLE_SPREAD_TRADING=false
+export NBA_BOT_ENABLE_TOTAL_TRADING=false
+export NBA_BOT_ENABLE_FIRST_HALF_TRADING=false
+```
+
+### 6. Running the Scanner
 
 The `nba-bot-scan` tool connects the model to Polymarket prices.
 
@@ -86,7 +138,7 @@ nba-bot-scan --mode live
 nba-bot-scan --mode live --ws
 ```
 
-### 6. Paper Trading
+### 7. Paper Trading
 
 Enable paper trading to automatically record signals and track simulated profit & loss.
 
@@ -102,7 +154,7 @@ nba-bot-scan --mode live --ws --paper
 After the NBA games finish, you need to settle your pending paper trades exactly as Polymarket resolved them:
 
 ```bash
-# View active bankroll and pending trades
+# View active bankroll, live positions, and recent closed trades
 nba-bot-settle --status
 
 # Preview settlement P&L math (without writing to the disk)
@@ -113,6 +165,33 @@ nba-bot-settle
 
 # Commit settlement with platform fees applied (for hardened trades)
 nba-bot-settle --hardened
+```
+
+**Sample `--status` output (live paper trading enabled):**
+```
+  Current bankroll : $2,456.78
+  Active trades    : 3
+  Closed trades    : 12
+
+  Active exposure by event:
+    - lakers-vs-warriors-2025-03-09: $340.00 (spread=$200.00, total=$140.00)
+
+  [1] Lakers @ Warriors - Spread: Lakers -5.5
+       Status      : OPEN
+       Model       : xgb_spread_t2
+       Direction   : BUY YES
+       Bucket      : spread
+       Enter price : 0.6400
+       Current px  : 0.6724
+       Target exit : 0.6720
+       Stake       : $200.00
+       Unrealized  : +$10.12
+       Edge        : 2.76%
+       Placed at   : 2025-03-09T02:14:31+00:00
+
+  Recent closed trades:
+    - Warriors vs Celtics - Total: Over 223.5 | CONVERGENCE_TARGET | P&L +$18.45
+    - Lakers @ Warriors - Spread: Lakers -5.5 | EDGE_THRESHOLD | P&L -$5.22
 ```
 
 ---
@@ -158,6 +237,62 @@ nba-bot-settle --dry-run --hardened
 ```
 
 **Tip:** Use `--seed` when you want to reproduce a specific run (e.g., debugging or parameter comparisons). Omit it for realistic variance across runs.
+
+---
+
+## 📈 Live Paper Trading (Pre-Resolution Exits)
+
+Live paper trading extends hardened mode to actively manage positions and exit before market resolution, enabling you to profit from price convergence during games rather than holding shares until the final outcome.
+
+### Position lifecycle
+
+- **OPEN:** When a hardened trade is filled, it starts as `OPEN` with real-time P&L tracking.
+- **CLOSED:** Positions can close early via any exit trigger (see below). Final P&L is realized and the bankroll is updated immediately.
+- **PENDING:** Legacy status for non-hardened trades; still supported for backward compatibility.
+
+### Exit triggers
+
+Hardened live positions automatically close when any of these conditions are met:
+
+| Trigger | Description | Configurable via |
+|---------|-------------|------------------|
+| **Convergence Target** | Exit when market price reaches a configurable percentage of the model’s expected value | `NBA_BOT_CONVERGENCE_TARGET_PCT` |
+| **Edge Threshold** | Exit when the edge shrinks below a minimum | `NBA_BOT_MIN_EXIT_EDGE` |
+| **Time-based** | Force exit shortly before game end (e.g., 5 minutes) | `NBA_BOT_PRE_GAME_EXIT_MINUTES` |
+| **Stop Loss** | Exit if price moves against the position beyond a threshold | `NBA_BOT_STOP_LOSS_PCT` |
+
+### What’s tracked in real time
+
+- `current_price` and `current_edge`
+- `unrealized_pnl` while OPEN
+- `target_exit_price` for convergence exits
+- `exit_price`, `exit_timestamp`, `exit_reason` when CLOSED
+- `realized_pnl` after early exits
+
+### Live monitoring in the scanner
+
+When you run with `--paper-hardened`, each scan loop now:
+1. Checks all OPEN positions against current prices (WS or CLOB)
+2. Applies exit rules and closes positions if triggered
+3. Prints a concise monitor summary:
+```
+  Live monitor      : checked=3 | closed=1 | missing_price=0 | realized_pnl=+$12.34
+```
+
+### Usage
+
+```bash
+# Enable live paper trading (default enabled)
+export NBA_BOT_LIVE_PAPER_TRADING_ENABLED=true
+
+# Run hardened scanner with live exits
+nba-bot-scan --mode live --ws --paper-hardened --seed 42
+
+# View live positions and recent closed trades
+nba-bot-settle --status
+```
+
+**Note:** Live paper trading respects all existing hardened controls (exposure caps, clustering, fill probability, slippage, etc.).
 
 ---
 

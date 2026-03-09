@@ -17,9 +17,11 @@ import os
 import random
 import re
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from nba_bot.config import (
+    CONVERGENCE_TARGET_PCT,
     DEFAULT_BANKROLL,
     DISABLE_STOCHASTIC_FILL,
     FILL_PROB_BASE,
@@ -28,6 +30,8 @@ from nba_bot.config import (
     LATENCY_MAX_MS,
     LATENCY_MEAN_MS,
     LATENCY_STD_MS,
+    LIVE_PAPER_TRADING_ENABLED,
+    MAX_CONCURRENT_POSITIONS,
     MAX_FIRST_HALF_EXPOSURE_PCT,
     MAX_GAME_EXPOSURE_PCT,
     MAX_MONEYLINE_EXPOSURE_PCT,
@@ -36,17 +40,23 @@ from nba_bot.config import (
     MAX_SPREAD_EXPOSURE_PCT,
     MAX_STAKE_LIQUIDITY_PCT,
     MAX_TOTAL_EXPOSURE_PCT,
+    MIN_EXIT_EDGE,
     PAPER_BANKROLL_PATH,
     PAPER_TRADES_PATH,
+    PLATFORM_FEE_RATE,
     PRICE_DRIFT_STD,
+    PRICE_UPDATE_INTERVAL_SEC,
+    PRE_GAME_EXIT_MINUTES,
     SLIPPAGE_BASE,
     SPREAD_CLUSTER_DISTANCE,
+    STOP_LOSS_PCT,
     TOTAL_CLUSTER_DISTANCE,
 )
 
 logger = logging.getLogger(__name__)
 PENDING_TRADE_MAX_AGE_HOURS = 6
 HARDENED_EXECUTION_STATS: dict[str, int] = {}
+ACTIVE_POSITION_STATUSES = {"PENDING", "OPEN"}
 
 
 def _normalize_model_key(model_key: str | None) -> str | None:
@@ -58,6 +68,45 @@ def _normalize_model_key(model_key: str | None) -> str | None:
 
 def _trade_model_key(trade: dict) -> str | None:
     return _normalize_model_key(trade.get("model_key"))
+
+
+def _coerce_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _current_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _is_active_status(status: str | None) -> bool:
+    return str(status or "").upper() in ACTIVE_POSITION_STATUSES
+
+
+def count_active_positions(model_key: str | None = None) -> int:
+    normalized_model_key = _normalize_model_key(model_key)
+    count = 0
+    for trade in load_trades():
+        if not _is_active_status(trade.get("status")):
+            continue
+        if normalized_model_key is not None and _trade_model_key(trade) != normalized_model_key:
+            continue
+        count += 1
+    return count
 
 
 def _load_bankroll_payload() -> dict:
@@ -226,7 +275,7 @@ def has_active_position(market_id: str, model_key: str | None = None) -> bool:
     """
     normalized_model_key = _normalize_model_key(model_key)
     for trade in load_trades():
-        if trade.get("market_id") != market_id or trade.get("status") != "PENDING":
+        if trade.get("market_id") != market_id or not _is_active_status(trade.get("status")):
             continue
         if normalized_model_key is not None and _trade_model_key(trade) != normalized_model_key:
             continue
@@ -239,7 +288,7 @@ def _pending_cutoff_time() -> datetime:
 
 
 def _is_recent_pending_trade(trade: dict, cutoff_time: datetime | None = None) -> bool:
-    if trade.get("status") != "PENDING":
+    if not _is_active_status(trade.get("status")):
         return False
 
     cutoff_time = cutoff_time or _pending_cutoff_time()
@@ -383,6 +432,219 @@ def _record_hardened_decision(reason: str, alert: dict, level: str = "info", **f
     getattr(logger, level, logger.info)("Hardened decision — reason=%s | %s", reason, details)
 
 
+def _clock_to_seconds(clock: str | None) -> int | None:
+    if not clock or ":" not in str(clock):
+        return None
+    try:
+        minutes, seconds = str(clock).split(":", 1)
+        return max(int(minutes), 0) * 60 + max(int(seconds), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _game_near_completion(game: dict | None, bucket: str) -> bool:
+    if not game:
+        return False
+    remaining = _clock_to_seconds(game.get("clock"))
+    if remaining is None:
+        return False
+    threshold = PRE_GAME_EXIT_MINUTES * 60
+    try:
+        period = int(game.get("period", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if bucket == "first_half":
+        return period >= 2 and remaining <= threshold
+    return period >= 4 and remaining <= threshold
+
+
+def _resolve_trade_price(
+    trade: dict,
+    market_lookup: dict[str, dict] | None = None,
+    price_cache: dict | None = None,
+) -> tuple[float | None, float, str]:
+    token_id = trade.get("trade_token")
+    if token_id and price_cache is not None:
+        cached_price = _coerce_float(price_cache.get(token_id), default=-1.0)
+        if 0 < cached_price < 1:
+            return cached_price, _coerce_float(trade.get("liquidity")), "ws"
+
+    if token_id:
+        from nba_bot.polymarket import fetch_clob_midpoint
+
+        midpoint = fetch_clob_midpoint(token_id)
+        if midpoint is not None:
+            return midpoint, _coerce_float(trade.get("liquidity")), "clob"
+
+    market = None
+    if market_lookup is not None:
+        market = market_lookup.get(str(trade.get("market_id")))
+    if not market:
+        return None, _coerce_float(trade.get("liquidity")), "missing"
+
+    yes_token = market.get("yes_token") or market.get("clob_yes_id")
+    no_token = market.get("no_token") or market.get("clob_no_id")
+    price = None
+    if token_id and str(token_id) == str(yes_token):
+        price = _coerce_float(market.get("yes_price"), default=0.0)
+    elif token_id and str(token_id) == str(no_token):
+        price = _coerce_float(market.get("no_price"), default=0.0)
+    return (price if 0 < (price or 0.0) < 1 else None), _coerce_float(market.get("liquidity")), "gamma"
+
+
+def _entry_fill_price(trade: dict) -> float:
+    return _coerce_float(trade.get("final_price") or trade.get("adjusted_price") or trade.get("enter_price"))
+
+
+def _compute_target_exit_price(trade: dict) -> float:
+    model_prob = _coerce_float(trade.get("model_prob"))
+    entry_price = _entry_fill_price(trade)
+    stored_target = _coerce_float(trade.get("target_exit_price"), default=0.0)
+    if stored_target > 0:
+        return stored_target
+    if model_prob <= 0 or entry_price <= 0:
+        return entry_price
+    return round(entry_price + max(model_prob - entry_price, 0.0) * CONVERGENCE_TARGET_PCT, 4)
+
+
+def _should_exit_trade(trade: dict, current_price: float, current_edge: float | None, game: dict | None) -> str | None:
+    entry_price = _entry_fill_price(trade)
+    if entry_price <= 0 or current_price <= 0:
+        return None
+    if current_price <= entry_price * (1.0 - STOP_LOSS_PCT):
+        return "STOP_LOSS"
+    target_exit_price = _compute_target_exit_price(trade)
+    if target_exit_price > 0 and current_price >= target_exit_price:
+        return "CONVERGENCE_TARGET"
+    if current_edge is not None and current_edge <= MIN_EXIT_EDGE:
+        return "EDGE_THRESHOLD"
+    if _game_near_completion(game, trade.get("bucket") or classify_market_bucket(trade.get("market", ""))):
+        return "TIME_BASED"
+    return None
+
+
+def _close_trade(trade: dict, exit_price: float, exit_reason: str, liquidity: float, price_source: str) -> tuple[dict, float]:
+    shares = _coerce_float(trade.get("shares"))
+    stake = _coerce_float(trade.get("stake"))
+    notional = max(shares * exit_price, 0.0)
+    adjusted_exit_price, exit_slippage = apply_slippage(
+        exit_price,
+        "SELL",
+        notional,
+        liquidity,
+        trade.get("trade_token"),
+        trade_side="SELL",
+    )
+    final_exit_price, exit_latency_ms = simulate_latency_and_drift(adjusted_exit_price)
+    payout = round(max(shares * final_exit_price, 0.0), 2)
+    fee = 0.0
+    profit = round(payout - stake - fee, 2)
+    updated = dict(trade)
+    updated.update({
+        "status": "CLOSED",
+        "current_price": round(exit_price, 4),
+        "exit_price": round(final_exit_price, 4),
+        "exit_timestamp": _current_timestamp(),
+        "exit_reason": exit_reason,
+        "exit_slippage": round(exit_slippage, 4),
+        "exit_latency_ms": round(exit_latency_ms, 1),
+        "price_source": price_source,
+        "payout": payout,
+        "profit": profit,
+        "realized_pnl": profit,
+        "unrealized_pnl": 0.0,
+        "closed_before_resolution": True,
+    })
+    return updated, payout
+
+
+def monitor_live_positions(
+    markets: list[dict],
+    games_by_event_slug: dict[str, dict] | None = None,
+    price_cache: dict | None = None,
+) -> dict[str, float]:
+    summary = {
+        "checked": 0,
+        "closed": 0,
+        "missing_price": 0,
+        "realized_pnl": 0.0,
+    }
+    if not LIVE_PAPER_TRADING_ENABLED:
+        return summary
+
+    trades = load_trades()
+    if not trades:
+        return summary
+
+    market_lookup = {str(market.get("market_id")): market for market in markets}
+    bankroll_deltas: dict[str | None, float] = defaultdict(float)
+    changed = False
+    now = datetime.now(timezone.utc)
+
+    for index, trade in enumerate(trades):
+        if not bool(trade.get("hardened", False)):
+            continue
+        if not _is_active_status(trade.get("status")):
+            continue
+        if _coerce_float(trade.get("shares")) <= 0:
+            continue
+
+        last_check = _parse_iso_datetime(trade.get("last_price_check"))
+        if last_check is not None and (now - last_check).total_seconds() < PRICE_UPDATE_INTERVAL_SEC:
+            continue
+
+        summary["checked"] += 1
+        current_price, liquidity, price_source = _resolve_trade_price(trade, market_lookup=market_lookup, price_cache=price_cache)
+        if current_price is None:
+            summary["missing_price"] += 1
+            continue
+
+        model_prob = _coerce_float(trade.get("model_prob"), default=-1.0)
+        current_edge = None if model_prob <= 0 else round(model_prob - current_price, 4)
+        unrealized_pnl = round(_coerce_float(trade.get("shares")) * current_price - _coerce_float(trade.get("stake")), 2)
+        updated_trade = dict(trade)
+        updated_trade.update({
+            "status": "OPEN",
+            "current_price": round(current_price, 4),
+            "current_edge": current_edge,
+            "unrealized_pnl": unrealized_pnl,
+            "last_price_check": now.isoformat(),
+            "liquidity": liquidity,
+            "price_source": price_source,
+            "target_exit_price": _compute_target_exit_price(trade),
+            "max_favorable_price": round(max(_coerce_float(trade.get("max_favorable_price"), default=current_price), current_price), 4),
+            "max_adverse_price": round(min(_coerce_float(trade.get("max_adverse_price"), default=current_price), current_price), 4),
+        })
+
+        exit_reason = _should_exit_trade(updated_trade, current_price, current_edge, (games_by_event_slug or {}).get(trade.get("event_slug", "")))
+        if exit_reason is not None:
+            closed_trade, payout = _close_trade(updated_trade, current_price, exit_reason, liquidity, price_source)
+            trades[index] = closed_trade
+            bankroll_deltas[_trade_model_key(trade)] += payout
+            summary["closed"] += 1
+            summary["realized_pnl"] += _coerce_float(closed_trade.get("realized_pnl"))
+            changed = True
+            print(
+                f"  LIVE PAPER EXIT: {closed_trade.get('direction')} | "
+                f"{closed_trade.get('market', closed_trade.get('market_id'))[:40]} | "
+                f"Reason: {exit_reason} | Exit: {closed_trade.get('exit_price'):.4f} | "
+                f"P&L: ${_coerce_float(closed_trade.get('realized_pnl')):+.2f}"
+            )
+            continue
+
+        trades[index] = updated_trade
+        changed = True
+
+    if changed:
+        save_trades(trades)
+    for model_key, payout in bankroll_deltas.items():
+        if payout <= 0:
+            continue
+        _save_bankroll(round(_load_bankroll(model_key=model_key) + payout, 2), model_key=model_key)
+    summary["realized_pnl"] = round(summary["realized_pnl"], 2)
+    return summary
+
+
 def compute_fill_probability(liquidity: float, edge: float) -> float:
     liquidity_signal = max(liquidity, 0.0) * max(FILL_PROB_LIQUIDITY_SCALE, 0.0) * 10.0
     liquidity_factor = liquidity_signal / (1.0 + liquidity_signal)
@@ -397,6 +659,7 @@ def apply_slippage(
     stake: float,
     liquidity: float,
     asset_id: str | None = None,
+    trade_side: str = "BUY",
 ) -> tuple[float, float]:
     if enter_price <= 0 or enter_price >= 1:
         return enter_price, SLIPPAGE_BASE
@@ -433,13 +696,14 @@ def apply_slippage(
 
         book = fetch_order_book(asset_id)
         if book:
-            vwap_price, filled_shares = compute_vwap_from_book(book, "BUY", stake)
+            vwap_price, filled_shares = compute_vwap_from_book(book, trade_side, stake)
             if vwap_price is not None:
                 adjusted_price, slippage = _cap_price_move(vwap_price, "order_book")
                 logger.debug(
-                    "Order-book fill estimate — asset_id=%s | direction=%s | enter_price=%.4f | vwap=%.4f | adjusted=%.4f | slippage=%.4f | filled_shares=%.4f",
+                    "Order-book fill estimate — asset_id=%s | direction=%s | trade_side=%s | enter_price=%.4f | vwap=%.4f | adjusted=%.4f | slippage=%.4f | filled_shares=%.4f",
                     asset_id,
                     direction,
+                    trade_side,
                     enter_price,
                     vwap_price,
                     adjusted_price,
@@ -455,7 +719,7 @@ def apply_slippage(
                 filled_shares,
             )
 
-    if asset_id:
+    if asset_id and trade_side == "BUY":
         from nba_bot.market_analytics import estimate_slippage_from_trades
 
         shares = stake / enter_price
@@ -468,9 +732,10 @@ def apply_slippage(
         if adjusted_price is not None:
             adjusted_price, slippage = _cap_price_move(adjusted_price, "trades")
             logger.debug(
-                "Trade-history fill estimate — asset_id=%s | direction=%s | enter_price=%.4f | adjusted=%.4f | slippage=%.4f | shares=%.4f",
+                "Trade-history fill estimate — asset_id=%s | direction=%s | trade_side=%s | enter_price=%.4f | adjusted=%.4f | slippage=%.4f | shares=%.4f",
                 asset_id,
                 direction,
+                trade_side,
                 enter_price,
                 adjusted_price,
                 slippage,
@@ -481,7 +746,10 @@ def apply_slippage(
     base_liquidity = max(liquidity, 1.0)
     slippage = SLIPPAGE_BASE + (stake / base_liquidity) * 0.001
     slippage = _clamp_slippage(slippage, "liquidity")
-    adjusted_price = enter_price * (1 + slippage)
+    if trade_side == "SELL":
+        adjusted_price = enter_price * (1 - slippage)
+    else:
+        adjusted_price = enter_price * (1 + slippage)
     adjusted_price = min(max(adjusted_price, 0.02), 0.98)
     slippage = abs(adjusted_price - enter_price) / max(enter_price, 0.01)
     slippage = min(max(slippage, SLIPPAGE_BASE), MAX_SLIPPAGE_PCT)
@@ -613,6 +881,16 @@ def execute_paper_trade_hardened(alert: dict, data_api_checked: bool = True) -> 
         _record_hardened_decision("bankroll_nonpositive", alert, level="warning", bankroll=f"{bankroll:.2f}")
         return False
 
+    active_positions = count_active_positions(model_key=model_key)
+    if active_positions >= MAX_CONCURRENT_POSITIONS:
+        _record_hardened_decision(
+            "max_concurrent_positions",
+            alert,
+            active_positions=str(active_positions),
+            max_positions=str(MAX_CONCURRENT_POSITIONS),
+        )
+        return False
+
     stake = round(raw_stake * bankroll, 2)
     if liquidity > 0:
         stake = min(stake, round(liquidity * MAX_STAKE_LIQUIDITY_PCT, 2))
@@ -677,9 +955,13 @@ def execute_paper_trade_hardened(alert: dict, data_api_checked: bool = True) -> 
         _record_hardened_decision("invalid_shares", alert, level="warning", final_price=f"{final_price:.4f}")
         return False
 
+    model_prob = _coerce_float(alert.get("model_prob"), default=0.0)
+    target_exit_price = round(final_price + max(model_prob - final_price, 0.0) * CONVERGENCE_TARGET_PCT, 4)
+    timestamp = _current_timestamp()
+
     trades = load_trades()
     trades.append({
-        "timestamp":      datetime.now(timezone.utc).isoformat(),
+        "timestamp":      timestamp,
         "market_id":      market_id,
         "event_slug":     event_slug,
         "market":         market,
@@ -692,15 +974,25 @@ def execute_paper_trade_hardened(alert: dict, data_api_checked: bool = True) -> 
         "enter_price":    enter_price,
         "adjusted_price": round(adjusted_price, 4),
         "final_price":    round(final_price, 4),
+        "current_price":  round(final_price, 4),
         "stake":          stake,
         "shares":         round(shares, 6),
+        "model_prob":     round(model_prob, 4) if model_prob > 0 else None,
         "edge":           round(edge, 4),
+        "current_edge":   round(model_prob - final_price, 4) if model_prob > 0 else None,
         "slippage":       round(slippage, 4),
         "latency_ms":     round(latency_ms, 1),
         "fill_prob":      round(fill_prob, 3),
         "liquidity":      liquidity,
-        "status":         "PENDING",
+        "target_exit_price": target_exit_price,
+        "unrealized_pnl": 0.0,
+        "realized_pnl":   0.0,
+        "max_favorable_price": round(final_price, 4),
+        "max_adverse_price": round(final_price, 4),
+        "last_price_check": timestamp,
+        "status":         "OPEN",
         "hardened":       True,
+        "closed_before_resolution": False,
     })
     save_trades(trades)
 

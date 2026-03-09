@@ -23,6 +23,8 @@ from nba_bot.paper import _load_bankroll, _save_bankroll, classify_market_bucket
 
 logger = logging.getLogger(__name__)
 
+ACTIVE_SETTLEMENT_STATUSES = {"PENDING", "OPEN"}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Status display
@@ -33,7 +35,8 @@ def _run_status() -> None:
     bankroll = _load_bankroll()
     model_bankrolls = load_model_bankrolls()
     trades   = load_trades()
-    pending  = [t for t in trades if t.get("status") == "PENDING"]
+    pending  = [t for t in trades if t.get("status") in ACTIVE_SETTLEMENT_STATUSES]
+    closed   = [t for t in trades if t.get("status") == "CLOSED"]
     event_bucket_exposure: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
 
     for trade in pending:
@@ -51,11 +54,12 @@ def _run_status() -> None:
             f"{model_key}=${amount:,.2f}"
             for model_key, amount in sorted(model_bankrolls.items())
         ))
-    print(f"  Pending trades   : {len(pending)}")
+    print(f"  Active trades    : {len(pending)}")
+    print(f"  Closed trades    : {len(closed)}")
 
     if pending:
         print()
-        print("  Pending exposure by event:")
+        print("  Active exposure by event:")
         for event_slug, bucket_totals in sorted(event_bucket_exposure.items()):
             total_stake = sum(bucket_totals.values())
             bucket_summary = ", ".join(
@@ -67,16 +71,34 @@ def _run_status() -> None:
         print()
         for i, t in enumerate(pending, 1):
             print(f"  [{i}] {t.get('market', t.get('market_id', '?'))}")
+            print(f"       Status      : {t.get('status')}")
             if t.get("model_key") or t.get("model_label"):
                 print(f"       Model       : {t.get('model_label') or t.get('model_key')}")
             print(f"       Direction   : {t.get('direction')}")
             print(f"       Bucket      : {t.get('bucket') or classify_market_bucket(t.get('market', ''))}")
             print(f"       Enter price : {t.get('enter_price')}")
+            if t.get("current_price") is not None:
+                print(f"       Current px  : {t.get('current_price')}")
+            if t.get("target_exit_price") is not None:
+                print(f"       Target exit : {t.get('target_exit_price')}")
             print(f"       Stake       : ${t.get('stake', 0):,.2f}")
-            print(f"       Edge        : {t.get('edge', 0) * 100:.2f}%")
+            if t.get("unrealized_pnl") is not None:
+                print(f"       Unrealized  : ${float(t.get('unrealized_pnl', 0) or 0):+,.2f}")
+            print(f"       Edge        : {float(t.get('current_edge', t.get('edge', 0)) or 0) * 100:.2f}%")
             print(f"       Placed at   : {t.get('timestamp', '?')}")
     else:
-        print("  No pending trades.")
+        print("  No active trades.")
+
+    if closed:
+        recent_closed = sorted(
+            closed,
+            key=lambda trade: trade.get("exit_timestamp", trade.get("timestamp", "")),
+            reverse=True,
+        )[:5]
+        print()
+        print("  Recent closed trades:")
+        for trade in recent_closed:
+            print(f"    - {trade.get('market', trade.get('market_id', '?'))[:45]} | {trade.get('exit_reason', 'CLOSED')} | P&L ${float(trade.get('realized_pnl', trade.get('profit', 0)) or 0):+,.2f}")
 
     print()
     sys.exit(0)
@@ -207,18 +229,18 @@ def _settle_trade(trade: dict, mkt: dict, hardened: bool = False) -> dict | None
 def _run_settle(dry_run: bool, hardened: bool = False) -> None:
     """Core settlement routine."""
     trades  = load_trades()
-    pending = [(i, t) for i, t in enumerate(trades) if t.get("status") == "PENDING"]
+    pending = [(i, t) for i, t in enumerate(trades) if t.get("status") in ACTIVE_SETTLEMENT_STATUSES]
     has_hardened_pending = hardened or any(bool(t.get("hardened", False)) for _, t in pending)
 
     if not pending:
-        print("\n  No pending trades to settle.\n")
+        print("\n  No active trades to settle.\n")
         sys.exit(0)
 
     print()
     print("=" * 60)
     print(f"  NBA BOT PAPER TRADING — {'DRY RUN ' if dry_run else ''}SETTLEMENT")
     print("=" * 60)
-    print(f"  Pending trades   : {len(pending)}")
+    print(f"  Active trades    : {len(pending)}")
     if dry_run:
         print("  *** DRY RUN — no files will be written ***")
     if has_hardened_pending:
@@ -260,7 +282,7 @@ def _run_settle(dry_run: bool, hardened: bool = False) -> None:
             trade_hardened = bool(hardened or trade.get("hardened", False))
             updated = _settle_trade(trade, mkt, hardened=trade_hardened)
             if updated is None:
-                print(f"  ⏳ PENDING  | {trade.get('market', market_id)[:50]} — market not yet closed")
+                print(f"  ⏳ {trade.get('status', 'PENDING'):<8} | {trade.get('market', market_id)[:50]} — market not yet closed")
                 skipped_count += 1
                 continue
 
